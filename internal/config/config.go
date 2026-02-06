@@ -7,7 +7,7 @@ import (
 	"strconv"
 	"time"
 
-	"pgtest/internal/testutil"
+	"pgtest-transient/internal/testutil"
 
 	"gopkg.in/yaml.v3"
 )
@@ -118,15 +118,14 @@ func LoadConfigWithPath(configPath string) (*LoadConfigResult, error) {
 		// Se fornecido explicitamente, usa o caminho fornecido
 		finalConfigPath = configPath
 	} else {
-		// Por padrão, busca pgtest.yaml na pasta do executável
+		// Por padrão, busca pgtest-transient.yaml na pasta do executável
 		execPath, err := os.Executable()
 		if err == nil {
 			execDir := filepath.Dir(execPath)
-			finalConfigPath = filepath.Join(execDir, "pgtest.yaml")
+			finalConfigPath = filepath.Join(execDir, "pgtest-transient.yaml")
 		} else {
-			// Fallback: tenta config/pgtest.yaml relativo ao diretório de trabalho
 			workDir, _ := os.Getwd()
-			finalConfigPath = filepath.Join(workDir, "config", "pgtest.yaml")
+			finalConfigPath = filepath.Join(workDir, "config", "pgtest-transient.yaml")
 		}
 	}
 

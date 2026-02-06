@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"pgtest/internal/proxy"
-	"pgtest/internal/testutil"
+	"pgtest-transient/internal/proxy"
+	"pgtest-transient/internal/testutil"
 )
 
 // assertSavepointQuery verifica se a query contém SAVEPOINT (case-insensitive) e se contém o nível esperado.

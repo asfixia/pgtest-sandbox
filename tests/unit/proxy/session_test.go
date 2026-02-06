@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"pgtest/internal/config"
-	"pgtest/internal/proxy"
+	"pgtest-transient/internal/config"
+	"pgtest-transient/internal/proxy"
 )
 
 func TestGetOrCreateSession(t *testing.T) {

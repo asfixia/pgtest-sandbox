@@ -8,9 +8,9 @@ import (
 	"syscall"
 	"time"
 
-	"pgtest/internal/config"
-	"pgtest/internal/proxy"
-	"pgtest/pkg/logger"
+	"pgtest-transient/internal/config"
+	"pgtest-transient/internal/proxy"
+	"pgtest-transient/pkg/logger"
 )
 
 func main() {

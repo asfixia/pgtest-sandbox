@@ -3,7 +3,7 @@ package postgres_test
 import (
 	"testing"
 
-	"pgtest/pkg/postgres"
+	"pgtest-transient/pkg/postgres"
 )
 
 func TestQuoteIdentifier(t *testing.T) {

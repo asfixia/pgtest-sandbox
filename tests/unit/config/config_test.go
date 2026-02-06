@@ -5,7 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"pgtest/internal/config"
+	"pgtest-transient/internal/config"
 )
 
 // findProjectRoot encontra a raiz do projeto (onde está go.mod)
@@ -32,7 +32,7 @@ func TestLoadConfig_FromFile(t *testing.T) {
 		t.Skip("Could not find project root (go.mod not found)")
 	}
 
-	configPath := filepath.Join(projectRoot, "config", "pgtest.yaml")
+	configPath := filepath.Join(projectRoot, "config", "pgtest-transient.yaml")
 
 	// Verifica se arquivo existe antes de testar
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
@@ -149,7 +149,7 @@ func TestLoadConfig_FromEnvVar(t *testing.T) {
 	}()
 
 	// Define variável de ambiente apontando para o arquivo de config
-	configPath := "config/pgtest.yaml"
+	configPath := "config/pgtest-transient.yaml"
 	os.Setenv("PGTEST_CONFIG", configPath)
 
 	cfg, err := config.LoadConfig("")
@@ -185,7 +185,7 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 		t.Skip("Could not find project root (go.mod not found)")
 	}
 
-	configPath := filepath.Join(projectRoot, "config", "pgtest.yaml")
+	configPath := filepath.Join(projectRoot, "config", "pgtest-transient.yaml")
 
 	// Se arquivo não existe, cria um temporário para teste
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
@@ -290,14 +290,14 @@ func TestLoadConfig_ProjectRootDetection(t *testing.T) {
 		t.Skip("Could not find project root (go.mod not found)")
 	}
 
-	// Tenta carregar config/pgtest.yaml usando caminho relativo
+	// Tenta carregar config/pgtest-transient.yaml usando caminho relativo
 	// LoadConfig deve resolver relativo ao diretório de trabalho atual
-	configPath := filepath.Join(projectRoot, "config", "pgtest.yaml")
+	configPath := filepath.Join(projectRoot, "config", "pgtest-transient.yaml")
 
 	// Verifica se arquivo existe
 	if _, statErr := os.Stat(configPath); statErr == nil {
 		// Usa caminho relativo (deve funcionar se executado da raiz)
-		relPath := "config/pgtest.yaml"
+		relPath := "config/pgtest-transient.yaml"
 		cfg, err := config.LoadConfig(relPath)
 
 		// Se executado da raiz, deve funcionar

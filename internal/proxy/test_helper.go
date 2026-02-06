@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"pgtest/internal/config"
-	"pgtest/internal/testutil"
+	"pgtest-transient/internal/config"
+	"pgtest-transient/internal/testutil"
 )
 
 // logIfVerbose é um wrapper para testutil.LogIfVerbose para manter compatibilidade
@@ -47,16 +47,16 @@ func resolveConfigPath() string {
 
 	projectRoot := findProjectRoot()
 	if projectRoot != "" {
-		return filepath.Join(projectRoot, "config", "pgtest.yaml")
+		return filepath.Join(projectRoot, "config", "pgtest-transient.yaml")
 	}
 	workDir, _ := os.Getwd()
-	return filepath.Join(workDir, "config", "pgtest.yaml")
+	return filepath.Join(workDir, "config", "pgtest-transient.yaml")
 }
 
 // newPGTestFromConfig cria uma instância PGTest a partir da configuração
 // Tenta carregar de:
 // 1. Variável de ambiente PGTEST_CONFIG (se definida)
-// 2. config/pgtest.yaml (relativo ao diretório de trabalho)
+// 2. config/pgtest-transient.yaml (relativo ao diretório de trabalho)
 // 3. Busca automática (pasta do executável ou config/)
 // Se não conseguir carregar a configuração, usa valores padrão
 func newPGTestFromConfig() *PGTest {

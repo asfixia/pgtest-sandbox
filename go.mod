@@ -1,4 +1,4 @@
-module pgtest
+module pgtest-transient
 
 go 1.23
 

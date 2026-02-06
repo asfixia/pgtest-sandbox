@@ -7,8 +7,8 @@ import (
 	"os"
 	"strings"
 
-	"pgtest/pkg/protocol"
-	"pgtest/pkg/sql"
+	"pgtest-transient/pkg/protocol"
+	"pgtest-transient/pkg/sql"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"

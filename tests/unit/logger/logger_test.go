@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"pgtest/pkg/logger"
+	"pgtest-transient/pkg/logger"
 )
 
 func TestLogLevel(t *testing.T) {

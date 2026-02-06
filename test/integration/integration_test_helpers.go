@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	"pgtest/internal/config"
-	"pgtest/internal/testutil"
-	"pgtest/pkg/logger"
+	"pgtest-transient/internal/config"
+	"pgtest-transient/internal/testutil"
+	"pgtest-transient/pkg/logger"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -41,7 +41,7 @@ func init() {
 			}
 			projectRoot = parent
 		}
-		configPath = filepath.Join(projectRoot, "config", "pgtest.yaml")
+		configPath = filepath.Join(projectRoot, "config", "pgtest-transient.yaml")
 	}
 	cfg, err := config.LoadConfig(configPath)
 	if err != nil {

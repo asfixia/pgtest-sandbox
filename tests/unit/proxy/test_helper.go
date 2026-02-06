@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"pgtest/internal/proxy"
-	sqlpkg "pgtest/pkg/sql"
+	"pgtest-transient/internal/proxy"
+	sqlpkg "pgtest-transient/pkg/sql"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -82,12 +82,11 @@ func getConfigPath() string {
 		}
 		return envPath
 	}
-	// Tenta config/pgtest.yaml relativo à raiz do projeto
 	projectRoot := findProjectRoot()
 	if projectRoot != "" {
-		return filepath.Join(projectRoot, "config", "pgtest.yaml")
+		return filepath.Join(projectRoot, "config", "pgtest-transient.yaml")
 	}
-	return "config/pgtest.yaml"
+	return "config/pgtest-transient.yaml"
 }
 
 // findProjectRoot encontra a raiz do projeto (onde está go.mod)

@@ -5,8 +5,8 @@ import (
 	"log"
 	"os"
 
-	"pgtest/pkg/protocol"
-	"pgtest/pkg/sql"
+	"pgtest-transient/pkg/protocol"
+	"pgtest-transient/pkg/sql"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgproto3"

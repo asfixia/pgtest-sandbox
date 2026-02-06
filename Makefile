@@ -1,7 +1,7 @@
 .PHONY: build test test-unit test-integration run clean
 
 build:
-	go build -o bin/pgtest ./cmd/pgtest
+	go build -o bin/pgtest-transient ./cmd/pgtest
 
 test: test-unit test-integration
 
@@ -12,7 +12,7 @@ test-integration:
 	go test -v ./test/integration/... -tags=integration
 
 run: build
-	./bin/pgtest
+	./bin/pgtest-transient
 
 clean:
 	rm -rf bin/
