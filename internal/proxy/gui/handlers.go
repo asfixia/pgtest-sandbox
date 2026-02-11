@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"strings"
 
-	"pgtest-transient/internal/config"
+	"pgtest-sandbox/internal/config"
 )
 
 // ConfigResponse is the config returned by GET /api/config (includes masked password and config_path).
@@ -109,7 +109,9 @@ func handleAPIConfigGet(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(ConfigResponse{
-		ConfigPath: config.GetConfigPath(),
+		// Use EffectiveConfigPath so the UI always sees the path it will
+		// use when saving (even if the file didn't exist at startup).
+		ConfigPath: config.EffectiveConfigPath(),
 		Config:     config.ConfigForAPI(cfg),
 	})
 }
@@ -120,7 +122,8 @@ func handleAPIConfigSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
-		Config *config.Config `json:"config"`
+		Config     *config.Config `json:"config"`
+		ConfigPath string         `json:"config_path"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
@@ -130,6 +133,12 @@ func handleAPIConfigSave(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "config required", http.StatusBadRequest)
 		return
 	}
+	// Determine which path to save to: user-provided or default.
+	path := strings.TrimSpace(payload.ConfigPath)
+	if path == "" {
+		path = config.EffectiveConfigPath()
+	}
+	config.SetConfigPath(path)
 	if err := config.UpdateAndSave(payload.Config); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

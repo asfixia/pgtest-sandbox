@@ -3,7 +3,7 @@ package protocol_test
 import (
 	"testing"
 
-	"pgtest-transient/pkg/protocol"
+	"pgtest-sandbox/pkg/protocol"
 )
 
 func TestExtractTestID(t *testing.T) {

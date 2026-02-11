@@ -13,7 +13,7 @@ import (
 	"sync"
 	"time"
 
-	"pgtest-transient/pkg/protocol"
+	"pgtest-sandbox/pkg/protocol"
 
 	"github.com/jackc/pgx/v5/pgproto3"
 )

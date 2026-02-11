@@ -3,7 +3,7 @@ package gui
 import (
 	"strings"
 
-	"pgtest-transient/internal/tray"
+	"pgtest-sandbox/internal/tray"
 )
 
 const apiBasePlaceholder = "__API_BASE__"
@@ -285,7 +285,11 @@ const htmlTemplate = `<!DOCTYPE html>
   <div id="settingsModal" class="modal">
     <div class="modal-content">
       <h2>Settings</h2>
-      <div id="config_path_display" class="config-path">Config file: —</div>
+      <div class="config-path">
+        <label>Config file path
+          <input type="text" id="cfg_config_path" name="config_path" placeholder="">
+        </label>
+      </div>
       <form id="settingsForm">
         <div class="section">
           <div class="section-title">Postgres</div>
@@ -325,6 +329,9 @@ const htmlTemplate = `<!DOCTYPE html>
   <script>
     const tbody = document.getElementById('tbody');
     const refreshBtn = document.getElementById('refresh');
+    var settingsModal = document.getElementById('settingsModal');
+    var settingsBtn = document.getElementById('settingsBtn');
+    var settingsForm = document.getElementById('settingsForm');
     function escapeHtml(s) {
       const div = document.createElement('div');
       div.textContent = s;
@@ -450,7 +457,9 @@ const htmlTemplate = `<!DOCTYPE html>
         }
       }
     }
+    // Preserve UI state across polling updates so modal/history don't close unexpectedly.
     function render(sessions) {
+      var settingsModalOpen = settingsModal && settingsModal.classList.contains('visible');
       var rows = tbody.querySelectorAll('tr');
       for (var i = 0; i < rows.length; i++) {
         if (rows[i].classList.contains('history-row')) continue;
@@ -468,6 +477,7 @@ const htmlTemplate = `<!DOCTYPE html>
       if (sessions.length === 0) {
         tbody.innerHTML = '<tr><td colspan="4" class="empty">No sessions</td></tr>';
         lastRenderedSessions = null;
+        if (settingsModalOpen && settingsModal) settingsModal.classList.add('visible');
         return;
       }
       var keysNow = sessionKeys(sessions);
@@ -475,14 +485,16 @@ const htmlTemplate = `<!DOCTYPE html>
       if (keysPrev === null || keysNow !== keysPrev) {
         fullReplace(sessions);
         lastRenderedSessions = JSON.parse(JSON.stringify(sessions));
+        if (settingsModalOpen && settingsModal) settingsModal.classList.add('visible');
         return;
       }
       for (var i = 0; i < sessions.length; i++) {
         updateRow(sessions[i].test_id, sessions[i]);
       }
       lastRenderedSessions = JSON.parse(JSON.stringify(sessions));
+      if (settingsModalOpen && settingsModal) settingsModal.classList.add('visible');
     }
-    // Polling (not SSE): /api/sessions returns query_history in execution order (oldest first). We render in that order so timestamps ascend top-to-bottom.
+    // Polling: we only ever replace tbody contents. Preserve UI state (settings modal open, history rows open, scroll) in render() so updates don't close modals or collapse panels.
     function load() {
       fetch('__API_BASE__/sessions').then(function(r) { return r.json(); }).then(render).catch(function(e) { tbody.innerHTML = '<tr><td colspan="4" class="empty">Error: ' + escapeHtml(e.message) + '</td></tr>'; });
     }
@@ -490,9 +502,6 @@ const htmlTemplate = `<!DOCTYPE html>
     load();
     setInterval(load, 1000);
 
-    var settingsModal = document.getElementById('settingsModal');
-    var settingsBtn = document.getElementById('settingsBtn');
-    var settingsForm = document.getElementById('settingsForm');
     if (settingsBtn && settingsModal) {
       settingsBtn.addEventListener('click', function() {
         settingsModal.classList.add('visible');
@@ -503,6 +512,7 @@ const htmlTemplate = `<!DOCTYPE html>
           var px = c.proxy || {};
           var l = c.logging || {};
           var t = c.test || {};
+          var cfgPath = data.config_path || '';
           document.getElementById('cfg_postgres_host').value = p.host || '';
           document.getElementById('cfg_postgres_port').value = p.port || '';
           document.getElementById('cfg_postgres_database').value = p.database || '';
@@ -520,7 +530,11 @@ const htmlTemplate = `<!DOCTYPE html>
           document.getElementById('cfg_test_context_timeout').value = (t.context_timeout || '').toString();
           document.getElementById('cfg_test_query_timeout').value = (t.query_timeout || '').toString();
           document.getElementById('cfg_test_ping_timeout').value = (t.ping_timeout || '').toString();
-          document.getElementById('config_path_display').textContent = 'Config file: ' + (data.config_path || '—');
+          var cfgPathInput = document.getElementById('cfg_config_path');
+          if (cfgPathInput) {
+            cfgPathInput.value = cfgPath;
+            if (!cfgPathInput.placeholder) cfgPathInput.placeholder = cfgPath || cfgPathInput.placeholder;
+          }
         }).catch(function(e) { alert('Failed to load config: ' + e.message); });
       });
     }
@@ -535,6 +549,8 @@ const htmlTemplate = `<!DOCTYPE html>
     if (settingsForm) {
       settingsForm.addEventListener('submit', function(e) {
         e.preventDefault();
+        var cfgPathInput = document.getElementById('cfg_config_path');
+        var cfgPathVal = cfgPathInput ? cfgPathInput.value : '';
         var pw = document.getElementById('cfg_postgres_password').value;
         var p = {
           host: document.getElementById('cfg_postgres_host').value,
@@ -560,7 +576,7 @@ const htmlTemplate = `<!DOCTYPE html>
           query_timeout: document.getElementById('cfg_test_query_timeout').value,
           ping_timeout: document.getElementById('cfg_test_ping_timeout').value
         };
-        var payload = { config: { postgres: p, proxy: px, logging: l, test: t } };
+        var payload = { config: { postgres: p, proxy: px, logging: l, test: t }, config_path: cfgPathVal };
         fetch('__API_BASE__/config/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

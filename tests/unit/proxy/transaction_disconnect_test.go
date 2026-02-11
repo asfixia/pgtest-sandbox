@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"pgtest-transient/internal/testutil"
+	"pgtest-sandbox/internal/testutil"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // Driver for database/sql
 )

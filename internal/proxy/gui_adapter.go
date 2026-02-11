@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"pgtest-transient/internal/proxy/gui"
+	"pgtest-sandbox/internal/proxy/gui"
 )
 
 // sessionProviderAdapter adapts *Server to gui.SessionProvider so the GUI package does not import proxy.

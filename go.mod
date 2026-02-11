@@ -1,4 +1,4 @@
-module pgtest-transient
+module pgtest-sandbox
 
 go 1.23
 

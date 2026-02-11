@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"pgtest-transient/internal/testutil"
+	"pgtest-sandbox/internal/testutil"
 
 	"gopkg.in/yaml.v3"
 )
@@ -140,14 +140,14 @@ func LoadConfigWithPath(configPath string) (*LoadConfigResult, error) {
 		// Se fornecido explicitamente, usa o caminho fornecido
 		finalConfigPath = configPath
 	} else {
-		// Por padrão, busca pgtest-transient.yaml na pasta do executável
+		// Por padrão, busca pgtest-sandbox.yaml na pasta do executável
 		execPath, err := os.Executable()
 		if err == nil {
 			execDir := filepath.Dir(execPath)
-			finalConfigPath = filepath.Join(execDir, "pgtest-transient.yaml")
+			finalConfigPath = filepath.Join(execDir, "pgtest-sandbox.yaml")
 		} else {
 			workDir, _ := os.Getwd()
-			finalConfigPath = filepath.Join(workDir, "config", "pgtest-transient.yaml")
+			finalConfigPath = filepath.Join(workDir, "config", "pgtest-sandbox.yaml")
 		}
 	}
 
@@ -190,6 +190,17 @@ func LoadConfigWithPath(configPath string) (*LoadConfigResult, error) {
 		Config:     config,
 		ConfigPath: configFileUsed,
 	}, nil
+}
+
+// EffectiveConfigPath returns the current config file path if set, otherwise
+// falls back to the default resolution used by tests/tools (testutil.ConfigPath).
+// This is used by the GUI so both the backend and UI have a single source of truth
+// for the expected config file location.
+func EffectiveConfigPath() string {
+	if p := GetConfigPath(); p != "" {
+		return p
+	}
+	return testutil.ConfigPath()
 }
 
 func loadFromEnv(config *Config) {

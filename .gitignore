@@ -1,9 +1,9 @@
 /.history
-config/pgtest-transient.yaml
+config/pgtest-sandbox.yaml
 .env
 bin/
 *.exe
-/config/pgtest-transient.yaml
+/config/pgtest-sandbox.yaml
 /.idea
 /.opencode
 *.md

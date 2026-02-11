@@ -3,8 +3,8 @@ package proxy
 import (
 	"time"
 
-	"pgtest-transient/internal/config"
-	"pgtest-transient/internal/testutil"
+	"pgtest-sandbox/internal/config"
+	"pgtest-sandbox/internal/testutil"
 )
 
 // logIfVerbose é um wrapper para testutil.LogIfVerbose para manter compatibilidade
@@ -16,7 +16,7 @@ func logIfVerbose(format string, args ...interface{}) {
 // newPGTestFromConfig cria uma instância PGTest a partir da configuração
 // Tenta carregar de:
 // 1. Variável de ambiente PGTEST_CONFIG (se definida)
-// 2. config/pgtest-transient.yaml (relativo ao diretório de trabalho)
+// 2. config/pgtest-sandbox.yaml (relativo ao diretório de trabalho)
 // 3. Busca automática (pasta do executável ou config/)
 // Se não conseguir carregar a configuração, usa valores padrão
 func newPGTestFromConfig() *PGTest {

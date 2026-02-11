@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"pgtest-transient/internal/config"
-	"pgtest-transient/internal/proxy"
+	"pgtest-sandbox/internal/config"
+	"pgtest-sandbox/internal/proxy"
 
 	_ "github.com/jackc/pgx/v5/stdlib" // Driver para database/sql
 )

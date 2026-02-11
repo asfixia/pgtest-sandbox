@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"pgtest-transient/internal/config"
+	"pgtest-sandbox/internal/config"
 )
 
 // InitFromConfig inicializa o logger padrão a partir da configuração

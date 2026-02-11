@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 )
 
-const defaultConfigRel = "config/pgtest-transient.yaml"
+const defaultConfigRel = "config/pgtest-sandbox.yaml"
 
 // ProjectRoot returns the project root directory (directory containing go.mod).
 // Returns empty string if not found (e.g. when run outside the repo).
@@ -27,7 +27,7 @@ func ProjectRoot() string {
 
 // ConfigPath returns the path to the pgtest config file to use.
 // 1. If PGTEST_CONFIG is set: use it (absolute as-is; relative is joined with project root, or cwd if no root).
-// 2. Else: projectRoot/config/pgtest-transient.yaml, or cwd/config/pgtest-transient.yaml if no project root.
+// 2. Else: projectRoot/config/pgtest-sandbox.yaml, or cwd/config/pgtest-sandbox.yaml if no project root.
 // All callers that need a root/config path should use this so behavior is unified.
 func ConfigPath() string {
 	if envPath := os.Getenv("PGTEST_CONFIG"); envPath != "" {

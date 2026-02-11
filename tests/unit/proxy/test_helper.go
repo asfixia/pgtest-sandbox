@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"pgtest-transient/internal/config"
-	"pgtest-transient/internal/proxy"
-	"pgtest-transient/internal/testutil"
-	sqlpkg "pgtest-transient/pkg/sql"
+	"pgtest-sandbox/internal/config"
+	"pgtest-sandbox/internal/proxy"
+	"pgtest-sandbox/internal/testutil"
+	sqlpkg "pgtest-sandbox/pkg/sql"
 
 	"github.com/jackc/pgx/v5"
 )

@@ -15,9 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"pgtest-transient/internal/proxy"
-	"pgtest-transient/pkg/logger"
-	"pgtest-transient/pkg/postgres"
+	"pgtest-sandbox/internal/proxy"
+	"pgtest-sandbox/pkg/logger"
+	"pgtest-sandbox/pkg/postgres"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )

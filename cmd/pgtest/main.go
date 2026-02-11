@@ -5,10 +5,10 @@ import (
 	"log"
 	"os"
 
-	"pgtest-transient/internal/config"
-	"pgtest-transient/internal/proxy"
-	"pgtest-transient/internal/tray"
-	"pgtest-transient/pkg/logger"
+	"pgtest-sandbox/internal/config"
+	"pgtest-sandbox/internal/proxy"
+	"pgtest-sandbox/internal/tray"
+	"pgtest-sandbox/pkg/logger"
 )
 
 func main() {

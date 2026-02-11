@@ -60,6 +60,14 @@ func GetConfigPath() string {
 	return global.configPath
 }
 
+// SetConfigPath updates the path of the config file used by UpdateAndSave / API.
+// Used when the GUI explicitly chooses or infers a config path.
+func SetConfigPath(path string) {
+	global.mu.Lock()
+	defer global.mu.Unlock()
+	global.configPath = path
+}
+
 // SetConfig replaces the in-memory config (used after saving to file).
 func SetConfig(c *Config) {
 	global.mu.Lock()
