@@ -19,4 +19,6 @@ type SessionProvider interface {
 	GetSessions() []SessionInfo
 	DestroySession(testID string) error
 	ClearHistory(testID string) error
+	// DestroyAllSessions disconnects all clients (rollback all sessions). Returns count destroyed.
+	DestroyAllSessions() (int, error)
 }

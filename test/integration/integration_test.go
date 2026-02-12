@@ -306,6 +306,64 @@ func TestTransactionPersistenceAcrossReconnections(t *testing.T) {
 	execPgtestRollback(t, pgtestDB2)
 }
 
+// TestConcurrentConnectionsSameSession runs multiple connections (same testID) that each execute
+// a query at the same time. Without serialization the backend returns "conn busy" for some.
+// With serialization they run one after another; all must succeed.
+// Uses prepared statements so all use the Extended Query path (Parse + Execute).
+func TestConcurrentConnectionsSameSession(t *testing.T) {
+	testID := "test_concurrent_same_session"
+	dsn := getPGTestProxyDSN(testID)
+	const numConcurrentConnections = 10
+
+	dbs := make([]*sql.DB, numConcurrentConnections)
+	for i := range dbs {
+		db, err := sql.Open("pgx", dsn)
+		if err != nil {
+			t.Fatalf("Failed to open connection %d: %v", i+1, err)
+		}
+		defer db.Close()
+		dbs[i] = db
+		pingConnection(t, db)
+	}
+
+	query := "SELECT 1 FROM pg_sleep(0.15)"
+	stmts := make([]*sql.Stmt, numConcurrentConnections)
+	for i, db := range dbs {
+		stmt, err := db.Prepare(query)
+		if err != nil {
+			t.Fatalf("Prepare on conn %d: %v", i+1, err)
+		}
+		defer stmt.Close()
+		stmts[i] = stmt
+	}
+
+	results := make([]int, numConcurrentConnections)
+	errs := make([]error, numConcurrentConnections)
+	done := make([]chan struct{}, numConcurrentConnections)
+	for i := range done {
+		done[i] = make(chan struct{})
+	}
+	for i := 0; i < numConcurrentConnections; i++ {
+		idx := i
+		go func() {
+			defer close(done[idx])
+			errs[idx] = stmts[idx].QueryRow().Scan(&results[idx])
+		}()
+	}
+	for i := range done {
+		<-done[i]
+	}
+
+	for i := 0; i < numConcurrentConnections; i++ {
+		if errs[i] != nil {
+			t.Errorf("Connection %d query failed (conn busy or other): %v", i+1, errs[i])
+		}
+		if results[i] != 1 {
+			t.Errorf("Connection %d result = %d, want 1", i+1, results[i])
+		}
+	}
+}
+
 // TestResetSessionPingBeforeQuery reproduces the response-attribution bug: after full rollback,
 // db.Query(tableExistenceQuery) triggers ResetSession (which sends "-- ping") then the query.
 // This test uses a single connection to rule out pool reordering and asserts we get exactly

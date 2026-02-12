@@ -54,6 +54,18 @@ func (a *sessionProviderAdapter) ClearHistory(testID string) error {
 	return nil
 }
 
+func (a *sessionProviderAdapter) DestroyAllSessions() (int, error) {
+	sessions := a.s.Pgtest.GetAllSessions()
+	n := 0
+	for testID := range sessions {
+		if err := a.s.Pgtest.DestroySession(testID); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
 // guiMux returns the HTTP handler for the GUI (same-port: /, /gui, /gui/, /api/...).
 func guiMux(server *Server) http.Handler {
 	return gui.NewMux(&sessionProviderAdapter{s: server})

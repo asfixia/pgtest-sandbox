@@ -68,6 +68,11 @@ const htmlTemplate = `<!DOCTYPE html>
       border: 1px solid #475569;
     }
     .toolbar .settings-btn:hover { background: #334155; color: #f1f5f9; }
+    .toolbar .rollback-all-btn {
+      background: #b91c1c;
+      color: #fff;
+    }
+    .toolbar .rollback-all-btn:hover { background: #dc2626; }
     .table-wrap {
       background: rgba(30, 41, 59, 0.85);
       border-radius: 12px;
@@ -272,6 +277,7 @@ const htmlTemplate = `<!DOCTYPE html>
       <h1><span>PGTest</span> Sessions</h1>
       <div class="toolbar">
         <button type="button" id="refresh">Refresh</button>
+        <button type="button" id="rollbackAllBtn" class="rollback-all-btn">Rollback All</button>
         <button type="button" class="settings-btn" id="settingsBtn">Settings</button>
       </div>
     </header>
@@ -344,6 +350,13 @@ const htmlTemplate = `<!DOCTYPE html>
         return isNaN(d.getTime()) ? at : d.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'medium' });
       } catch (e) { return at; }
     }
+    function prettySql(sql) {
+      if (!sql || typeof sql !== 'string') return sql;
+      var s = sql.trim();
+      if (s.length > 2000) return s;
+      var re = /\b(SELECT|FROM|WHERE|AND|OR|LEFT JOIN|RIGHT JOIN|INNER JOIN|JOIN|ON|GROUP BY|ORDER BY|LIMIT|OFFSET|INSERT INTO|UPDATE|SET|VALUES|RETURNING|DELETE FROM|CREATE |ALTER |DROP |BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE SAVEPOINT|WITH|UNION|HAVING)\b/gi;
+      return s.replace(re, function(m) { return '\n' + m; }).replace(/\n+/g, '\n').trim();
+    }
     function historyItemHtml(item) {
       var query = '';
       var at = '';
@@ -353,7 +366,7 @@ const htmlTemplate = `<!DOCTYPE html>
       } else {
         query = typeof item === 'string' ? item : '';
       }
-      return at + escapeHtml(query);
+      return at + escapeHtml(prettySql(query));
     }
     var openHistoryIds = {};
     var historyScrollTops = {};
@@ -499,6 +512,15 @@ const htmlTemplate = `<!DOCTYPE html>
       fetch('__API_BASE__/sessions').then(function(r) { return r.json(); }).then(render).catch(function(e) { tbody.innerHTML = '<tr><td colspan="4" class="empty">Error: ' + escapeHtml(e.message) + '</td></tr>'; });
     }
     refreshBtn.addEventListener('click', load);
+    var rollbackAllBtn = document.getElementById('rollbackAllBtn');
+    if (rollbackAllBtn) {
+      rollbackAllBtn.addEventListener('click', function() {
+        fetch('__API_BASE__/sessions/rollback-all', { method: 'POST' })
+          .then(function(r) { if (!r.ok) throw new Error(r.statusText); return r.json(); })
+          .then(function() { load(); })
+          .catch(function(e) { alert('Rollback All failed: ' + (e && e.message ? e.message : e)); });
+      });
+    }
     load();
     setInterval(load, 1000);
 

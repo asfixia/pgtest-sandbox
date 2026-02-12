@@ -2,6 +2,7 @@ package tray
 
 import (
 	"fmt"
+	"net/http"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -44,24 +45,25 @@ func onReady(guiURL string) {
 	proxyAddr := proxyAddressFromGUIURL(guiURL)
 	systray.SetTooltip(fmt.Sprintf("PGTest Proxy – %s", proxyAddr))
 
-	mOpen := systray.AddMenuItem("Open GUI", "Open PGTest GUI in the browser")
+	mOpen := systray.AddMenuItem(fmt.Sprintf("Open GUI \"%s\"", guiURL), "Open PGTest GUI in the browser")
+	mRollbackAll := systray.AddMenuItem("Rollback All", "Disconnect all clients (rollback all sessions)")
 	systray.AddSeparator()
 	mProxy := systray.AddMenuItem("PostgreSQL proxy: "+proxyAddr, "Address to use as host:port in your app")
 	mProxy.Disable()
 	mCopy := systray.AddMenuItem("Copy connection URL", "Copy host=... port=... to clipboard")
 	systray.AddSeparator()
-	mStatus := systray.AddMenuItem(guiURL, "GUI address")
-	mStatus.Disable()
-	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quit", "Stop PGTest and exit")
 
 	connectionLine := connectionString(proxyAddr)
 
+	rollbackAllURL := strings.TrimSuffix(guiURL, "/") + "/api/sessions/rollback-all"
 	go func() {
 		for {
 			select {
 			case <-mOpen.ClickedCh:
 				openBrowser(guiURL)
+			case <-mRollbackAll.ClickedCh:
+				_, _ = http.Post(rollbackAllURL, "application/json", nil)
 			case <-mCopy.ClickedCh:
 				copyToClipboard(connectionLine)
 			case <-mQuit.ClickedCh:

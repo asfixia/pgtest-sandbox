@@ -137,13 +137,13 @@ func (p *proxyConnection) ForwardMultipleCommandsToDB(testID string, commands []
 		return fmt.Errorf("sessão existe mas sem transaction: '%s'", testID)
 	}
 
-	session.DB.LockRun()
+	// SetLastQuery uses d.mu.Lock(); do not call it while holding LockRun() (same mutex) to avoid deadlock.
 	fullQuery := strings.Join(commands, "; ")
 	session.DB.SetLastQuery(fullQuery)
 	if !strings.HasSuffix(fullQuery, ";") {
 		fullQuery += ";"
 	}
-	//mrr := pgConn.Exec(context.Background(), "savepoint ")
+	session.DB.LockRun()
 
 	mrr := pgConn.Exec(context.Background(), fullQuery)
 	defer mrr.Close()

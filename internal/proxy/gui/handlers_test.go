@@ -32,6 +32,15 @@ func (m *mockProvider) ClearHistory(testID string) error {
 	return m.clearErr
 }
 
+func (m *mockProvider) DestroyAllSessions() (int, error) {
+	n := len(m.sessions)
+	for _, s := range m.sessions {
+		m.destroyed = append(m.destroyed, s.TestID)
+	}
+	m.sessions = nil
+	return n, nil
+}
+
 // --- GET /api/sessions ---
 
 func TestHandleAPISessions_ReturnsJSON(t *testing.T) {
@@ -207,6 +216,58 @@ func TestHandleAPIClearHistory_MethodNotAllowed(t *testing.T) {
 
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+}
+
+// --- POST /api/sessions/rollback-all ---
+
+func TestHandleAPISessionsRollbackAll_ReturnsDestroyedCount(t *testing.T) {
+	provider := &mockProvider{
+		sessions: []SessionInfo{
+			{TestID: "a", InTransaction: true},
+			{TestID: "b", InTransaction: false},
+		},
+	}
+	mux := NewMux(provider)
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/rollback-all", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var out struct {
+		Destroyed int `json:"destroyed"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Destroyed != 2 {
+		t.Errorf("destroyed = %d, want 2", out.Destroyed)
+	}
+	if len(provider.destroyed) != 2 {
+		t.Errorf("provider.destroyed length = %d, want 2", len(provider.destroyed))
+	}
+}
+
+func TestHandleAPISessionsRollbackAll_EmptySessions(t *testing.T) {
+	provider := &mockProvider{sessions: nil}
+	mux := NewMux(provider)
+	req := httptest.NewRequest(http.MethodPost, "/api/sessions/rollback-all", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	var out struct {
+		Destroyed int `json:"destroyed"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Destroyed != 0 {
+		t.Errorf("destroyed = %d, want 0", out.Destroyed)
 	}
 }
 

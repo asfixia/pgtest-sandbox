@@ -54,9 +54,25 @@ Ideal use cases
 
 ## Key differentiator
 
-- **Use the database you already have** — no need to create or maintain a dedicated test database. Point the proxy at your existing PostgreSQL (e.g. development or a shared instance).
+- **Use a real PostgreSQL database** — tests run against a real instance with a real schema, so behavior matches production closely.
 - The **single long-lived transaction** ensures that from the database’s perspective nothing is ever committed; when the process ends, everything is rolled back.
 - **Within a test**, you can still use normal transaction-like behavior (nested begin/commit/rollback) via the proxy’s TCL→savepoint mapping and the **pgtest commands** (see below).
+
+## ⚠️ Use a test-only database
+
+Even though pgtest-sandbox rolls back everything at the end, **you must point it only at a test / non‑production database**.
+
+Why:
+
+- pgtest keeps a **single long‑lived transaction** open. If you run **DDL** inside it (for example `ALTER TABLE`), PostgreSQL will take strong locks (often `ACCESS EXCLUSIVE`) that block other sessions on that table until the transaction finishes.
+- Those locks are visible immediately to other sessions; there is no way to “hide” them inside the transaction. On a shared dev or prod database this can cause real downtime and blocked queries.
+- Tests may also insert a lot of data or temporarily change constraints/indexes; even if it all rolls back, it can slow down or block other clients while tests are running.
+
+**Recommendation:**
+
+- Use pgtest-sandbox only against a **dedicated testing database** (or a dedicated testing cluster).
+- Never point it at a production database.
+- Avoid mixing pgtest traffic with critical interactive use of the same database.
 
 ## Build and run
 

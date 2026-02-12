@@ -14,6 +14,7 @@ func NewMux(provider SessionProvider) http.Handler {
 	mux.HandleFunc("/api/sessions", handleAPISessions(provider))
 	mux.HandleFunc("/api/sessions/close", handleAPISessionsClose(provider))
 	mux.HandleFunc("/api/sessions/clear-history", handleAPISessionsClearHistory(provider))
+	mux.HandleFunc("/api/sessions/rollback-all", handleAPISessionsRollbackAll(provider))
 	mux.HandleFunc("/api/config", handleAPIConfigGet)
 	mux.HandleFunc("/api/config/save", handleAPIConfigSave)
 	return mux

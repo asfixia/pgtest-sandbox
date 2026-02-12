@@ -96,6 +96,22 @@ func handleAPISessionsClearHistory(provider SessionProvider) http.HandlerFunc {
 	}
 }
 
+func handleAPISessionsRollbackAll(provider SessionProvider) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		n, err := provider.DestroyAllSessions()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]int{"destroyed": n})
+	}
+}
+
 func handleAPIConfigGet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		w.WriteHeader(http.StatusMethodNotAllowed)

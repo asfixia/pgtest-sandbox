@@ -175,6 +175,8 @@ func (p *proxyConnection) RunMessageLoop(testID string) {
 		case *pgproto3.Parse:
 			// Extended Query: intercept query, store in session, call PgConn.Prepare() to create
 			// the statement on the real PostgreSQL and cache the StatementDescription.
+			// LockRun serializes use of the shared backend so concurrent connections don't get "conn busy".
+			// Do NOT call any session.DB method that takes d.mu (RLock/Lock) while holding LockRun to avoid deadlock.
 			session := p.server.Pgtest.GetSession(testID)
 			if session == nil || session.DB == nil || session.DB.PgConn() == nil {
 				p.SendErrorResponse(fmt.Errorf("sessão não encontrada para testID: %s", testID))
@@ -186,23 +188,30 @@ func (p *proxyConnection) RunMessageLoop(testID string) {
 				continue
 			}
 			session.DB.SetPreparedStatement(msg.Name, interceptedQuery)
-			// Use PgConn.Prepare() which sends Parse+Describe(S)+Sync internally and handles
-			// the bg reader / lock correctly. This creates the prepared statement on PostgreSQL
-			// and gives us the StatementDescription (param OIDs, field descriptions).
-			//
-			// If the statement already exists on PostgreSQL (e.g. pgx reuses statement names
-			// across proxy connections sharing the same PgConn), deallocate it first.
+			// Read before LockRun: GetStatementDescription uses RLock; PgConn() uses RLock — calling either under Lock would deadlock.
+			var existingSD *pgconn.StatementDescription
 			if msg.Name != "" {
-				if existingSD := session.DB.GetStatementDescription(msg.Name); existingSD != nil {
-					_ = session.DB.PgConn().Deallocate(context.Background(), msg.Name)
-				}
+				existingSD = session.DB.GetStatementDescription(msg.Name)
 			}
-			sd, prepErr := session.DB.PgConn().Prepare(context.Background(), msg.Name, interceptedQuery, msg.ParameterOIDs)
+			pgConn := session.DB.PgConn()
+			var sd *pgconn.StatementDescription
+			var prepErr error
+			session.DB.LockRun()
+			if msg.Name != "" && existingSD != nil && pgConn != nil {
+				_ = pgConn.Deallocate(context.Background(), msg.Name)
+			}
+			if pgConn != nil {
+				sd, prepErr = pgConn.Prepare(context.Background(), msg.Name, interceptedQuery, msg.ParameterOIDs)
+			} else {
+				prepErr = fmt.Errorf("conexão backend indisponível")
+			}
+			session.DB.UnlockRun()
 			if prepErr != nil {
 				log.Printf("[PROXY] Prepare failed: %v", prepErr)
 				p.SendErrorResponse(prepErr)
 				continue
 			}
+			// SetStatementDescription uses Lock; call after UnlockRun to avoid deadlock.
 			session.DB.SetStatementDescription(msg.Name, sd)
 			p.backend.Send(&pgproto3.ParseComplete{})
 			p.backend.Flush()
@@ -219,6 +228,7 @@ func (p *proxyConnection) RunMessageLoop(testID string) {
 		case *pgproto3.Execute:
 			// Execute the prepared statement via PgConn.ExecPrepared() which sends
 			// Bind+Describe(P)+Execute+Sync internally and returns a ResultReader.
+			// LockRun serializes use of the shared backend so concurrent connections don't get "conn busy".
 			session := p.server.Pgtest.GetSession(testID)
 			if session == nil || session.DB == nil || session.DB.PgConn() == nil {
 				p.SendErrorResponse(fmt.Errorf("sessão não encontrada para testID: %s", testID))
@@ -236,7 +246,11 @@ func (p *proxyConnection) RunMessageLoop(testID string) {
 				session.DB.SetLastQueryWithParams(query, args)
 			}
 			resultFormats := session.DB.PortalResultFormats(msg.Portal)
-			if err := p.executeViaExecPrepared(context.Background(), session.DB.PgConn(), stmtName, params, formatCodes, resultFormats); err != nil {
+			pgConn := session.DB.PgConn()
+			session.DB.LockRun()
+			err = p.executeViaExecPrepared(context.Background(), pgConn, stmtName, params, formatCodes, resultFormats)
+			session.DB.UnlockRun()
+			if err != nil {
 				log.Printf("[PROXY] ExecPrepared failed: %v", err)
 				p.SendErrorResponse(err)
 			}
@@ -278,12 +292,17 @@ func (p *proxyConnection) RunMessageLoop(testID string) {
 
 		case *pgproto3.Close:
 			// Deallocate the statement on PostgreSQL (for statement close) and clean up local state.
+			// LockRun serializes use of the shared backend so concurrent connections don't get "conn busy".
+			// Get PgConn before LockRun; PgConn() takes RLock and would deadlock if called under Lock.
 			session := p.server.Pgtest.GetSession(testID)
 			if session != nil && session.DB != nil {
-				if msg.ObjectType == 'S' && session.DB.PgConn() != nil {
-					if err := session.DB.PgConn().Deallocate(context.Background(), msg.Name); err != nil {
+				pgConn := session.DB.PgConn()
+				if msg.ObjectType == 'S' && pgConn != nil {
+					session.DB.LockRun()
+					if err := pgConn.Deallocate(context.Background(), msg.Name); err != nil {
 						log.Printf("[PROXY] Deallocate failed: %v", err)
 					}
+					session.DB.UnlockRun()
 				}
 				session.DB.CloseStatementOrPortal(msg.ObjectType, msg.Name)
 			}
