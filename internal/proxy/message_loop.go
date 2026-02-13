@@ -145,203 +145,246 @@ func (p *proxyConnection) RunMessageLoop(testID string) {
 
 		switch msg := msg.(type) {
 		case *pgproto3.Query:
-			// Flow "Simple Query": O cliente envia uma string SQL direta.
-			// Espera-se que retornemos RowDescription, DataRow(s), CommandComplete e ReadyForQuery.
-			queryStr := msg.String
-			log.Printf("[PROXY] Query Simples Recebida (testID=%s, conn=%s): %s", testID, remoteAddr, queryStr)
-			if os.Getenv("PGTEST_LOG_MESSAGE_ORDER") == "1" {
-				preview := queryStr
-				if len(preview) > 60 {
-					preview = strings.TrimSpace(preview[:60]) + "..."
-				}
-				log.Printf("[MSG_ORDER] RECV SimpleQuery: %s", preview)
-			}
-			//p.mu.Lock()
-			//p.lastQuery = "" // Limpa a query armazenada para evitar execução duplicada
-			//p.inExtendedQuery = false
-			//p.mu.Unlock()
-			if err := p.ProcessSimpleQuery(testID, queryStr); err != nil {
-				log.Printf("[PROXY] Erro ao processar Query Simples: %v", err)
-				p.SendErrorResponse(err)
-			} else {
-				log.Printf("[PROXY] Query Simples processada com sucesso: %s", queryStr)
-			}
-			p.backend.Flush()
+			p.handleMessageQuery(testID, msg)
 
 		case *pgproto3.Parse:
-			// Extended Query: intercept query, store per-connection, call PgConn.Prepare() with
-			// connection-prefixed name so concurrent connections don't collide. LockRun serializes
-			// use of the shared backend. Do NOT call any session.DB method that takes d.mu while holding LockRun.
-			session := p.server.Pgtest.GetSession(testID)
-			if session == nil || session.DB == nil || session.DB.PgConn() == nil {
-				p.SendErrorResponse(fmt.Errorf("sessão não encontrada para testID: %s", testID))
-				continue
-			}
-			interceptedQuery, err := p.server.Pgtest.InterceptQuery(testID, msg.Query, p.connectionID())
-			if err != nil {
-				p.SendErrorResponse(err)
-				continue
-			}
-			p.SetPreparedStatement(msg.Name, interceptedQuery)
-			if session.DB != nil {
-				session.DB.SetPreparedStatement(msg.Name, interceptedQuery) // GUI/history
-			}
-			commands := sql.SplitCommands(interceptedQuery)
-			if len(commands) > 1 {
-				// PostgreSQL does not allow multiple commands in a prepared statement. Run as batch on Execute.
-				p.SetMultiStatement(msg.Name)
-				p.backend.Send(&pgproto3.ParseComplete{})
-				p.backend.Flush()
-				continue
-			}
-			backendName := p.backendStmtName(msg.Name)
-			var existingSD *pgconn.StatementDescription
-			if msg.Name != "" {
-				existingSD = p.GetStatementDescription(msg.Name)
-			}
-			pgConn := session.DB.PgConn()
-			var sd *pgconn.StatementDescription
-			var prepErr error
-			session.DB.LockRun()
-			if msg.Name != "" && existingSD != nil && pgConn != nil {
-				_ = pgConn.Deallocate(context.Background(), backendName)
-			}
-			if pgConn != nil {
-				sd, prepErr = pgConn.Prepare(context.Background(), backendName, interceptedQuery, msg.ParameterOIDs)
-			} else {
-				prepErr = fmt.Errorf("conexão backend indisponível")
-			}
-			session.DB.UnlockRun()
-			if prepErr != nil {
-				log.Printf("[PROXY] Prepare failed: %v", prepErr)
-				p.SendErrorResponse(prepErr)
-				continue
-			}
-			p.SetStatementDescription(msg.Name, sd)
-			p.backend.Send(&pgproto3.ParseComplete{})
-			p.backend.Flush()
+			p.handleMessageParse(testID, msg)
 
 		case *pgproto3.Bind:
-			// Store portal mapping per-connection. The actual Bind to PostgreSQL happens when
-			// Execute arrives (via ExecPrepared which uses backend-prefixed statement name).
-			p.BindPortal(msg.DestinationPortal, msg.PreparedStatement, msg.Parameters, msg.ParameterFormatCodes, msg.ResultFormatCodes)
-			p.backend.Send(&pgproto3.BindComplete{})
-			p.backend.Flush()
+			p.handleMessageBind(msg)
 
 		case *pgproto3.Execute:
-			// Execute the prepared statement via PgConn.ExecPrepared() using per-connection
-			// portal/statement state and backend-prefixed statement name. LockRun serializes backend use.
-			session := p.server.Pgtest.GetSession(testID)
-			if session == nil || session.DB == nil || session.DB.PgConn() == nil {
-				p.SendErrorResponse(fmt.Errorf("sessão não encontrada para testID: %s", testID))
-				continue
-			}
-			stmtName := p.PortalStatementName(msg.Portal)
-			query, params, formatCodes, ok := p.QueryForPortal(msg.Portal)
-			if !ok {
-				p.SendErrorResponse(fmt.Errorf("portal ou statement não encontrado para execução (portal=%q)", msg.Portal))
-				continue
-			}
-			if query != "" && session.DB != nil {
-				args := bindParamsToArgs(params, formatCodes)
-				session.DB.SetLastQueryWithParams(query, args)
-			}
-			if p.IsMultiStatement(stmtName) {
-				// Run as batch and send only the last result (same behavior as Simple Query multi-statement).
-				commands := sql.SplitCommands(query)
-				if err := p.SafeForwardMultipleCommandsToDB(testID, commands, false); err != nil {
-					log.Printf("[PROXY] multi-statement Execute failed: %v", err)
-					p.SendErrorResponse(err)
-					recoverSessionTxAfterDirectExec(session)
-				}
-				continue
-			}
-			resultFormats := p.PortalResultFormats(msg.Portal)
-			pgConn := session.DB.PgConn()
-			backendStmtName := p.backendStmtName(stmtName)
-			session.DB.LockRun()
-			err = p.executeViaExecPrepared(context.Background(), pgConn, backendStmtName, params, formatCodes, resultFormats)
-			session.DB.UnlockRun()
-			if err != nil {
-				log.Printf("[PROXY] ExecPrepared failed: %v", err)
-				p.SendErrorResponse(err)
-				recoverSessionTxAfterDirectExec(session)
-			}
+			p.handleMessageExecute(testID, msg)
 
 		case *pgproto3.Describe:
-			// Use per-connection cached StatementDescription to respond with ParameterDescription + RowDescription/NoData.
-			// Multi-statement "prepared" queries have no backend SD; send empty params + NoData.
-			var stmtName string
-			if msg.ObjectType == 'S' {
-				stmtName = msg.Name
-			} else {
-				stmtName = p.PortalStatementName(msg.Name)
-			}
-			if p.IsMultiStatement(stmtName) {
-				p.backend.Send(&pgproto3.ParameterDescription{ParameterOIDs: nil})
-				p.backend.Send(&pgproto3.NoData{})
-				p.backend.Flush()
-				continue
-			}
-			var sd *pgconn.StatementDescription
-			var resultFormats []int16
-			if msg.ObjectType == 'S' {
-				sd = p.GetStatementDescription(msg.Name)
-			} else {
-				sd = p.GetStatementDescriptionForPortal(msg.Name)
-				resultFormats = p.PortalResultFormats(msg.Name)
-			}
-			if sd == nil {
-				p.SendErrorResponse(fmt.Errorf("statement description not found for Describe (objectType=%c, name=%q)", msg.ObjectType, msg.Name))
-				continue
-			}
-			p.sendDescribeFromSD(sd, msg.ObjectType, resultFormats)
+			p.handleMessageDescribe(msg)
 
 		case *pgproto3.Sync:
-			// The real Sync+ReadyForQuery were already consumed by PgConn.Prepare() or ExecPrepared().
-			// We just send a synthetic ReadyForQuery to the client.
-			p.SendReadyForQuery()
-			//p.backend.Flush()
+			p.handleMessageSync()
 
 		case *pgproto3.Terminate:
 			return
 
 		case *pgproto3.Flush:
-			log.Printf("[PROXY] Flush recebido (testID=%s, conn=%s)", testID, remoteAddr)
-			p.backend.Flush()
+			p.handleMessageFlush(testID)
 
 		case *pgproto3.Close:
-			// Deallocate on backend using connection-prefixed name (only if we prepared it); clean up per-connection maps.
-			session := p.server.Pgtest.GetSession(testID)
-			if session != nil && session.DB != nil {
-				pgConn := session.DB.PgConn()
-				if msg.ObjectType == 'S' && pgConn != nil && !p.IsMultiStatement(msg.Name) {
-					backendName := p.backendStmtName(msg.Name)
-					session.DB.LockRun()
-					if err := pgConn.Deallocate(context.Background(), backendName); err != nil {
-						log.Printf("[PROXY] Deallocate failed: %v", err)
-					}
-					session.DB.UnlockRun()
-				}
-				p.CloseStatementOrPortal(msg.ObjectType, msg.Name)
-			}
-			p.backend.Send(&pgproto3.CloseComplete{})
-			p.backend.Flush()
+			p.handleMessageClose(testID, msg)
 
 		case *pgproto3.CopyData:
-			// Mensagens de tráfego de dados (COPY). Ignoramos no log para evitar spam,
-			// mas mantemos o fallback seguro de enviar ReadyForQuery para não travar.
-			log.Printf("[PROXY] CopyData ignorado (testID=%s, conn=%s)", testID, remoteAddr)
-			p.SendReadyForQuery()
-			p.backend.Flush()
+			p.handleMessageCopyData(testID)
 
 		default:
-			// Captura qualquer outra mensagem não tratada explicitamente.
-			log.Printf("[PROXY] ----------------- Mensagem não tratada: %T (testID=%s, conn=%s) - Enviando ReadyForQuery como fallback", msg, testID, remoteAddr)
-			p.SendReadyForQuery()
-			p.backend.Flush()
+			p.handleMessageDefault(testID, msg, remoteAddr)
 		}
 	}
+}
+
+func (p *proxyConnection) handleMessageDefault(testID string, msg pgproto3.FrontendMessage, remoteAddr string) {
+	// Captura qualquer outra mensagem não tratada explicitamente.
+	log.Printf("[PROXY] ----------------- Mensagem não tratada: %T (testID=%s, conn=%s) - Enviando ReadyForQuery como fallback", msg, testID, remoteAddr)
+	p.SendReadyForQuery()
+	p.backend.Flush()
+}
+
+func (p *proxyConnection) handleMessageCopyData(testID string) {
+	remoteAddr := p.clientConn.RemoteAddr().String()
+	// Mensagens de tráfego de dados (COPY). Ignoramos no log para evitar spam,
+	// mas mantemos o fallback seguro de enviar ReadyForQuery para não travar.
+	log.Printf("[PROXY] CopyData ignorado (testID=%s, conn=%s)", testID, remoteAddr)
+	p.SendReadyForQuery()
+	p.backend.Flush()
+}
+
+func (p *proxyConnection) handleMessageClose(testID string, msg *pgproto3.Close) {
+	// Deallocate on backend using connection-prefixed name (only if we prepared it); clean up per-connection maps.
+	session := p.server.Pgtest.GetSession(testID)
+	if session != nil && session.DB != nil {
+		pgConn := session.DB.PgConn()
+		if msg.ObjectType == 'S' && pgConn != nil && !p.IsMultiStatement(msg.Name) {
+			backendName := p.backendStmtName(msg.Name)
+			session.DB.LockRun()
+			if err := pgConn.Deallocate(context.Background(), backendName); err != nil {
+				log.Printf("[PROXY] Deallocate failed: %v", err)
+			}
+			session.DB.UnlockRun()
+		}
+		p.CloseStatementOrPortal(msg.ObjectType, msg.Name)
+	}
+	p.backend.Send(&pgproto3.CloseComplete{})
+	p.backend.Flush()
+}
+
+func (p *proxyConnection) handleMessageFlush(testID string) {
+	remoteAddr := p.clientConn.RemoteAddr().String()
+	log.Printf("[PROXY] Flush recebido (testID=%s, conn=%s)", testID, remoteAddr)
+	p.backend.Flush()
+}
+
+func (p *proxyConnection) handleMessageSync() {
+	// The real Sync+ReadyForQuery were already consumed by PgConn.Prepare() or ExecPrepared().
+	// We just send a synthetic ReadyForQuery to the client.
+	p.SendReadyForQuery()
+	//p.backend.Flush()
+}
+
+func (p *proxyConnection) handleMessageDescribe(msg *pgproto3.Describe) {
+	// Use per-connection cached StatementDescription to respond with ParameterDescription + RowDescription/NoData.
+	// Multi-statement "prepared" queries have no backend SD; send empty params + NoData.
+	var stmtName string
+	if msg.ObjectType == 'S' {
+		stmtName = msg.Name
+	} else {
+		stmtName = p.PortalStatementName(msg.Name)
+	}
+	if p.IsMultiStatement(stmtName) {
+		p.backend.Send(&pgproto3.ParameterDescription{ParameterOIDs: nil})
+		p.backend.Send(&pgproto3.NoData{})
+		p.backend.Flush()
+		return
+	}
+	var sd *pgconn.StatementDescription
+	var resultFormats []int16
+	if msg.ObjectType == 'S' {
+		sd = p.GetStatementDescription(msg.Name)
+	} else {
+		sd = p.GetStatementDescriptionForPortal(msg.Name)
+		resultFormats = p.PortalResultFormats(msg.Name)
+	}
+	if sd == nil {
+		p.SendErrorResponse(fmt.Errorf("statement description not found for Describe (objectType=%c, name=%q)", msg.ObjectType, msg.Name))
+		return
+	}
+	p.sendDescribeFromSD(sd, msg.ObjectType, resultFormats)
+}
+
+func (p *proxyConnection) handleMessageExecute(testID string, msg *pgproto3.Execute) {
+	// Execute the prepared statement via PgConn.ExecPrepared() using per-connection
+	// portal/statement state and backend-prefixed statement name. LockRun serializes backend use.
+	session := p.server.Pgtest.GetSession(testID)
+	if session == nil || session.DB == nil || session.DB.PgConn() == nil {
+		p.SendErrorResponse(fmt.Errorf("sessão não encontrada para testID: %s", testID))
+		return
+	}
+	stmtName := p.PortalStatementName(msg.Portal)
+	query, params, formatCodes, ok := p.QueryForPortal(msg.Portal)
+	if !ok {
+		p.SendErrorResponse(fmt.Errorf("portal ou statement não encontrado para execução (portal=%q)", msg.Portal))
+		return
+	}
+	if query != "" && session.DB != nil {
+		args := bindParamsToArgs(params, formatCodes)
+		session.DB.SetLastQueryWithParams(query, args)
+	}
+	if p.IsMultiStatement(stmtName) {
+		// Run as batch and send only the last result (same behavior as Simple Query multi-statement).
+		commands := sql.SplitCommands(query)
+		if err := p.SafeForwardMultipleCommandsToDB(testID, commands, false); err != nil {
+			log.Printf("[PROXY] multi-statement Execute failed: %v", err)
+			p.SendErrorResponse(err)
+			recoverSessionTxAfterDirectExec(session)
+		}
+		return
+	}
+	resultFormats := p.PortalResultFormats(msg.Portal)
+	pgConn := session.DB.PgConn()
+	backendStmtName := p.backendStmtName(stmtName)
+	session.DB.LockRun()
+	err := p.executeViaExecPrepared(context.Background(), pgConn, backendStmtName, params, formatCodes, resultFormats)
+	session.DB.UnlockRun()
+	if err != nil {
+		log.Printf("[PROXY] ExecPrepared failed: %v", err)
+		p.SendErrorResponse(err)
+		recoverSessionTxAfterDirectExec(session)
+	}
+}
+
+func (p *proxyConnection) handleMessageBind(msg *pgproto3.Bind) {
+	// Store portal mapping per-connection. The actual Bind to PostgreSQL happens when
+	// Execute arrives (via ExecPrepared which uses backend-prefixed statement name).
+	p.BindPortal(msg.DestinationPortal, msg.PreparedStatement, msg.Parameters, msg.ParameterFormatCodes, msg.ResultFormatCodes)
+	p.backend.Send(&pgproto3.BindComplete{})
+	p.backend.Flush()
+}
+
+func (p *proxyConnection) handleMessageParse(testID string, msg *pgproto3.Parse) {
+	// Extended Query: intercept query, store per-connection, call PgConn.Prepare() with
+	// connection-prefixed name so concurrent connections don't collide. LockRun serializes
+	// use of the shared backend. Do NOT call any session.DB method that takes d.mu while holding LockRun.
+	session := p.server.Pgtest.GetSession(testID)
+	if session == nil || session.DB == nil || session.DB.PgConn() == nil {
+		p.SendErrorResponse(fmt.Errorf("sessão não encontrada para testID: %s", testID))
+		return
+	}
+	interceptedQuery, err := p.server.Pgtest.InterceptQuery(testID, msg.Query, p.connectionID())
+	if err != nil {
+		p.SendErrorResponse(err)
+		return
+	}
+	p.SetPreparedStatement(msg.Name, interceptedQuery)
+	if session.DB != nil {
+		session.DB.SetPreparedStatement(msg.Name, interceptedQuery) // GUI/history
+	}
+	commands := sql.SplitCommands(interceptedQuery)
+	if len(commands) > 1 {
+		// PostgreSQL does not allow multiple commands in a prepared statement. Run as batch on Execute.
+		p.SetMultiStatement(msg.Name)
+		p.backend.Send(&pgproto3.ParseComplete{})
+		p.backend.Flush()
+		return
+	}
+	backendName := p.backendStmtName(msg.Name)
+	var existingSD *pgconn.StatementDescription
+	if msg.Name != "" {
+		existingSD = p.GetStatementDescription(msg.Name)
+	}
+	pgConn := session.DB.PgConn()
+	var sd *pgconn.StatementDescription
+	var prepErr error
+	session.DB.LockRun()
+	if msg.Name != "" && existingSD != nil && pgConn != nil {
+		_ = pgConn.Deallocate(context.Background(), backendName)
+	}
+	if pgConn != nil {
+		sd, prepErr = pgConn.Prepare(context.Background(), backendName, interceptedQuery, msg.ParameterOIDs)
+	} else {
+		prepErr = fmt.Errorf("conexão backend indisponível")
+	}
+	session.DB.UnlockRun()
+	if prepErr != nil {
+		log.Printf("[PROXY] Prepare failed: %v", prepErr)
+		p.SendErrorResponse(prepErr)
+		return
+	}
+	p.SetStatementDescription(msg.Name, sd)
+	p.backend.Send(&pgproto3.ParseComplete{})
+	p.backend.Flush()
+}
+
+func (p *proxyConnection) handleMessageQuery(testID string, msg *pgproto3.Query) {
+	// Flow "Simple Query": O cliente envia uma string SQL direta.
+	// Espera-se que retornemos RowDescription, DataRow(s), CommandComplete e ReadyForQuery.
+	queryStr := msg.String
+	remoteAddr := p.clientConn.RemoteAddr().String()
+	log.Printf("[PROXY] Query Simples Recebida (testID=%s, conn=%s): %s", testID, remoteAddr, queryStr)
+	if os.Getenv("PGTEST_LOG_MESSAGE_ORDER") == "1" {
+		preview := queryStr
+		if len(preview) > 60 {
+			preview = strings.TrimSpace(preview[:60]) + "..."
+		}
+		log.Printf("[MSG_ORDER] RECV SimpleQuery: %s", preview)
+	}
+	//p.mu.Lock()
+	//p.lastQuery = "" // Limpa a query armazenada para evitar execução duplicada
+	//p.inExtendedQuery = false
+	//p.mu.Unlock()
+	if err := p.ProcessSimpleQuery(testID, queryStr); err != nil {
+		log.Printf("[PROXY] Erro ao processar Query Simples: %v", err)
+		p.SendErrorResponse(err)
+	} else {
+		log.Printf("[PROXY] Query Simples processada com sucesso: %s", queryStr)
+	}
+	p.backend.Flush()
 }
 
 // ProcessSimpleQuery lida com o fluxo de "Simple Query" (pgproto3.Query).
