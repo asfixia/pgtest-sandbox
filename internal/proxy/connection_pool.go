@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,10 +14,23 @@ import (
 // A conexão pertence à sessão (TestSession) que a criou; não há pool separado.
 // O mesmo testID sempre usa a mesma conexão porque há apenas uma sessão por testID,
 // e a sessão guarda sua DB (conn+tx) em SessionsByTestID[testID].
-func newConnectionForTestID(host string, port int, database, user, password string, sessionTimeout time.Duration, testID string) (*pgx.Conn, error) {
+//
+// Connection parameters are set via pgx config (not DSN string concatenation) so that
+// host, user, password, database, and application_name can safely contain spaces and
+// special characters without manual escaping.
+func newConnectionForTestID(host string, port int, database string, user string, password string, sessionTimeout time.Duration, testID string) (*pgx.Conn, error) {
 	appName := getAppNameForTestID(testID)
-	dsn := fmt.Sprintf("host=%s port=%d database=%s user=%s password=%s application_name=%s",
-		host, port, database, user, password, appName)
+	u := &url.URL{
+		Scheme: "postgres",
+		User:   url.UserPassword(user, password),
+		Host:   fmt.Sprintf("%s:%d", host, port),
+		Path:   database,
+	}
+	q := u.Query()
+	q.Set("sslmode", "disable")
+	q.Set("application_name", appName)
+	u.RawQuery = q.Encode()
+	dsn := u.String()
 
 	config, err := pgx.ParseConfig(dsn)
 	if err != nil {

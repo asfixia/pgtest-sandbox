@@ -432,6 +432,120 @@ func TestTwoConnectionsSamePreparedStatementName(t *testing.T) {
 	}
 }
 
+// TestIntegrationDEALLOCATEOnlyAffectsOwnConnection: conn1 prepares a statement; conn2 sends
+// DEALLOCATE <name> as a simple query. The proxy rewrites to conn2's backend name, which
+// does not exist, so the backend returns an error. conn1's statement must still work.
+func TestIntegrationDEALLOCATEOnlyAffectsOwnConnection(t *testing.T) {
+	testID := "test_dealloc_own_only"
+	dsn := getPGTestProxyDSN(testID)
+	ctx := context.Background()
+
+	conn1, err := pgconn.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connection 1: %v", err)
+	}
+	defer conn1.Close(ctx)
+
+	conn2, err := pgconn.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connection 2: %v", err)
+	}
+	defer conn2.Close(ctx)
+
+	const stmtName = "pdo_stmt_00000001"
+	_, err = conn1.Prepare(ctx, stmtName, "SELECT 111", nil)
+	if err != nil {
+		t.Fatalf("conn1 Prepare: %v", err)
+	}
+
+	// conn2 tries to DEALLOCATE the same name (simple query, like PHP PDO). Proxy rewrites
+	// to conn2's backend name, which does not exist → backend error.
+	mrr := conn2.Exec(ctx, "DEALLOCATE "+stmtName)
+	err = mrr.Close()
+	if err == nil {
+		t.Fatal("conn2 DEALLOCATE of conn1's statement should fail (prepared statement does not exist)")
+	}
+	errStr := err.Error()
+	if !strings.Contains(errStr, "does not exist") && !strings.Contains(errStr, "26000") && !strings.Contains(errStr, "prepared statement") {
+		t.Errorf("expected 'does not exist' or SQLSTATE 26000, got: %v", err)
+	}
+
+	// conn1's statement must still work.
+	rr := conn1.ExecPrepared(ctx, stmtName, nil, nil, nil)
+	var val int
+	if rr.NextRow() {
+		vals := rr.Values()
+		if len(vals) > 0 && vals[0] != nil {
+			fmt.Sscanf(string(vals[0]), "%d", &val)
+		}
+	}
+	if _, err := rr.Close(); err != nil {
+		t.Fatalf("conn1 ExecPrepared after conn2 DEALLOCATE: %v", err)
+	}
+	if val != 111 {
+		t.Errorf("conn1 result = %d, want 111 (conn2 must not have deallocated conn1's statement)", val)
+	}
+}
+
+// TestIntegrationDEALLOCATEALLWithSameNameOnTwoConnections: both connections prepare the
+// same statement name. conn1 runs DEALLOCATE ALL (only its own is deallocated). conn2
+// must still be able to use its statement, then conn2 runs DEALLOCATE <name> and succeeds.
+func TestIntegrationDEALLOCATEALLWithSameNameOnTwoConnections(t *testing.T) {
+	testID := "test_dealloc_all_same_name"
+	dsn := getPGTestProxyDSN(testID)
+	ctx := context.Background()
+
+	conn1, err := pgconn.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connection 1: %v", err)
+	}
+	defer conn1.Close(ctx)
+
+	conn2, err := pgconn.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connection 2: %v", err)
+	}
+	defer conn2.Close(ctx)
+
+	const stmtName = "pdo_stmt_00000002"
+	_, err = conn1.Prepare(ctx, stmtName, "SELECT 201", nil)
+	if err != nil {
+		t.Fatalf("conn1 Prepare: %v", err)
+	}
+	_, err = conn2.Prepare(ctx, stmtName, "SELECT 202", nil)
+	if err != nil {
+		t.Fatalf("conn2 Prepare: %v", err)
+	}
+
+	// conn1 runs DEALLOCATE ALL. Only conn1's backend statement is deallocated; conn2's remains.
+	mrr := conn1.Exec(ctx, "DEALLOCATE ALL")
+	if err := mrr.Close(); err != nil {
+		t.Fatalf("conn1 DEALLOCATE ALL: %v", err)
+	}
+
+	// conn2 must still be able to execute (its statement was not touched by conn1's DEALLOCATE ALL).
+	rr2 := conn2.ExecPrepared(ctx, stmtName, nil, nil, nil)
+	var val2 int
+	if rr2.NextRow() {
+		vals := rr2.Values()
+		if len(vals) > 0 && vals[0] != nil {
+			fmt.Sscanf(string(vals[0]), "%d", &val2)
+		}
+	}
+	if _, err := rr2.Close(); err != nil {
+		t.Fatalf("conn2 ExecPrepared after conn1 DEALLOCATE ALL: %v", err)
+	}
+	if val2 != 202 {
+		t.Errorf("conn2 result = %d, want 202", val2)
+	}
+
+	// conn2 runs DEALLOCATE <name> (same client name); must succeed (deallocates only conn2's).
+	mrr2 := conn2.Exec(ctx, "DEALLOCATE "+stmtName)
+	if err := mrr2.Close(); err != nil {
+		t.Fatalf("conn2 DEALLOCATE %q: %v", stmtName, err)
+	}
+}
+
 // TestMultipleQueriesReturnsLastOnly ensures the proxy returns only the last result for a
 // multi-statement Simple Query. Example: "SELECT 1 as val; SELECT 2 as val;" must return
 // a single row with val = 2, not 1.

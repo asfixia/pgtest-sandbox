@@ -30,15 +30,34 @@ func recoverSessionTxAfterDirectExec(session *TestSession) {
 // Ela decide se é comando único ou múltiplos comandos e encaminha para o banco.
 // args são os parâmetros bound (Extended Query); para Simple Query não passar args.
 //
+// DEALLOCATE is rewritten so the backend sees this connection's prefixed statement names
+// (multiple client connections with the same testID share one backend but use per-connection prefixes).
+//
 // sendReadyForQuery:
 //   - true para fluxo "Simple Query" (envia ReadyForQuery ao final).
 //   - false para fluxo "Extended Query" (não envia, espera-se recebimento de Sync depois).
 func (p *proxyConnection) ExecuteInterpretedQuery(testID string, query string, sendReadyForQuery bool, args ...any) error {
 	commands := sql.SplitCommands(query)
-	if len(commands) > 1 {
-		return p.SafeForwardMultipleCommandsToDB(testID, commands, sendReadyForQuery)
+	var expanded []string
+	for _, cmd := range commands {
+		c := strings.TrimSpace(cmd)
+		if c == "" {
+			continue
+		}
+		rewritten, isDEALLOCATE := p.rewriteDEALLOCATEForBackend(c)
+		if isDEALLOCATE {
+			expanded = append(expanded, rewritten...)
+		} else {
+			expanded = append(expanded, c)
+		}
 	}
-	return p.ForwardCommandToDB(testID, query, sendReadyForQuery, args...)
+	if len(expanded) == 0 {
+		return p.ForwardCommandToDB(testID, query, sendReadyForQuery, args...)
+	} else if len(expanded) == 1 {
+		return p.ForwardCommandToDB(testID, expanded[0], sendReadyForQuery, args...)
+	} else {
+		return p.SafeForwardMultipleCommandsToDB(testID, expanded, sendReadyForQuery)
+	}
 }
 
 // ForwardCommandToDB executa um único comando SQL na conexão/transação ativa.

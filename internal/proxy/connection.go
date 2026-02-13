@@ -66,9 +66,9 @@ type proxyConnection struct {
 	userOpenTransactionCount int
 
 	// Per-connection Extended Query state (statement/portal names are client names; backend uses prefixed names).
-	preparedStatements   map[string]string
-	statementDescs       map[string]*pgconn.StatementDescription
-	portalToStatement    map[string]string
+	preparedStatements       map[string]string
+	statementDescs           map[string]*pgconn.StatementDescription
+	portalToStatement        map[string]string
 	portalParams             map[string][][]byte
 	portalFormatCodes        map[string][]int16
 	portalResultFormats      map[string][]int16
@@ -79,13 +79,13 @@ type proxyConnection struct {
 // A sessão já tem conexão PostgreSQL autenticada e transação ativa
 func (server *Server) startProxy(testID string, clientConn net.Conn, backend *pgproto3.Backend) {
 	proxy := &proxyConnection{
-		clientConn:            clientConn,
-		backend:               backend,
-		server:                server,
-		preparedStatements:    make(map[string]string),
-		statementDescs:        make(map[string]*pgconn.StatementDescription),
-		portalToStatement:     make(map[string]string),
-		portalParams:          make(map[string][][]byte),
+		clientConn:               clientConn,
+		backend:                  backend,
+		server:                   server,
+		preparedStatements:       make(map[string]string),
+		statementDescs:           make(map[string]*pgconn.StatementDescription),
+		portalToStatement:        make(map[string]string),
+		portalParams:             make(map[string][][]byte),
 		portalFormatCodes:        make(map[string][]int16),
 		portalResultFormats:      make(map[string][]int16),
 		multiStatementStatements: make(map[string]struct{}),
@@ -114,6 +114,73 @@ func (p *proxyConnection) backendStmtName(clientName string) string {
 		return ""
 	}
 	return fmt.Sprintf("c%d_%s", p.connectionID(), clientName)
+}
+
+// stripSQLCommentsForDEALLOCATE removes SQL comments from s so we can parse
+// "DEALLOCATE /**/ ALL" or "DEALLOCATE  -- comment\n ALL" as DEALLOCATE ALL.
+// Removes -- to end of line and /* */ blocks; replaced with space to avoid gluing tokens.
+func stripSQLCommentsForDEALLOCATE(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		if i+2 <= len(s) && s[i:i+2] == "--" {
+			for i < len(s) && s[i] != '\n' {
+				b.WriteByte(' ')
+				i++
+			}
+			continue
+		}
+		if i+2 <= len(s) && s[i:i+2] == "/*" {
+			b.WriteByte(' ')
+			b.WriteByte(' ')
+			i += 2
+			for i+1 < len(s) && s[i:i+2] != "*/" {
+				i++
+			}
+			if i+2 <= len(s) {
+				i += 2
+			}
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// rewriteDEALLOCATEForBackend rewrites a DEALLOCATE simple-query so the backend sees
+// this connection's prefixed statement names. Multiple client connections (same testID)
+// share one backend connection but each uses its own prefix; forwarding "DEALLOCATE pdo_stmt_00000003"
+// would fail because the backend has "c<id>_pdo_stmt_00000003".
+// Returns (rewritten commands, true) if query was DEALLOCATE; otherwise (nil, false).
+// For "DEALLOCATE name" returns one command with backend name. For "DEALLOCATE ALL" returns
+// one DEALLOCATE per prepared statement owned by this connection (or ["SELECT 1"] if none).
+// Parsing strips SQL comments (-- and /* */) so "DEALLOCATE /**/ ALL" is treated as DEALLOCATE ALL.
+func (p *proxyConnection) rewriteDEALLOCATEForBackend(query string) (rewritten []string, isDEALLOCATE bool) {
+	q := strings.TrimSpace(query)
+	const deallocatePrefix = "DEALLOCATE"
+	uq := strings.ToUpper(q)
+	if len(uq) < len(deallocatePrefix) || uq[:len(deallocatePrefix)] != deallocatePrefix {
+		return nil, false
+	}
+	rest := q[len(deallocatePrefix):]
+	rest = strings.TrimSpace(stripSQLCommentsForDEALLOCATE(rest))
+	rest = strings.TrimSpace(rest)
+	if rest == "" || strings.ToUpper(rest) == "ALL" {
+		names := p.copyPreparedStatementNames()
+		for _, name := range names {
+			if p.IsMultiStatement(name) {
+				continue
+			}
+			rewritten = append(rewritten, "DEALLOCATE "+p.backendStmtName(name))
+		}
+		if len(rewritten) == 0 {
+			rewritten = []string{"SELECT 1"}
+		}
+		return rewritten, true
+	}
+	return []string{"DEALLOCATE " + p.backendStmtName(rest)}, true
 }
 
 // SetPreparedStatement stores the intercepted query for the given statement name (Extended Query).
