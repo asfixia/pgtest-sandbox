@@ -118,13 +118,9 @@ func (p *proxyConnection) executeViaExecPrepared(ctx context.Context, pgConn *pg
 func (p *proxyConnection) RunMessageLoop(testID string) {
 	defer p.clientConn.Close()
 	defer func() {
-		session := p.server.Pgtest.GetSession(testID)
-		if session != nil && session.DB != nil {
-			if count := p.GetUserOpenTransactionCount(); count > 0 {
-				_ = session.DB.RollbackUserSavepointsOnDisconnect(context.Background(), count)
-			}
-			session.DB.ReleaseOpenTransaction(p.connectionID())
-		}
+		p.rollbackUserSavepointsOnDisconnect(testID)
+		p.releaseOpenTransactionOnDisconnect(testID)
+		p.deallocateBackendStatementsOnDisconnect(testID)
 	}()
 
 	// Log para rastrear qual conexão TCP está processando mensagens
@@ -173,10 +169,9 @@ func (p *proxyConnection) RunMessageLoop(testID string) {
 			p.backend.Flush()
 
 		case *pgproto3.Parse:
-			// Extended Query: intercept query, store in session, call PgConn.Prepare() to create
-			// the statement on the real PostgreSQL and cache the StatementDescription.
-			// LockRun serializes use of the shared backend so concurrent connections don't get "conn busy".
-			// Do NOT call any session.DB method that takes d.mu (RLock/Lock) while holding LockRun to avoid deadlock.
+			// Extended Query: intercept query, store per-connection, call PgConn.Prepare() with
+			// connection-prefixed name so concurrent connections don't collide. LockRun serializes
+			// use of the shared backend. Do NOT call any session.DB method that takes d.mu while holding LockRun.
 			session := p.server.Pgtest.GetSession(testID)
 			if session == nil || session.DB == nil || session.DB.PgConn() == nil {
 				p.SendErrorResponse(fmt.Errorf("sessão não encontrada para testID: %s", testID))
@@ -187,21 +182,32 @@ func (p *proxyConnection) RunMessageLoop(testID string) {
 				p.SendErrorResponse(err)
 				continue
 			}
-			session.DB.SetPreparedStatement(msg.Name, interceptedQuery)
-			// Read before LockRun: GetStatementDescription uses RLock; PgConn() uses RLock — calling either under Lock would deadlock.
+			p.SetPreparedStatement(msg.Name, interceptedQuery)
+			if session.DB != nil {
+				session.DB.SetPreparedStatement(msg.Name, interceptedQuery) // GUI/history
+			}
+			commands := sql.SplitCommands(interceptedQuery)
+			if len(commands) > 1 {
+				// PostgreSQL does not allow multiple commands in a prepared statement. Run as batch on Execute.
+				p.SetMultiStatement(msg.Name)
+				p.backend.Send(&pgproto3.ParseComplete{})
+				p.backend.Flush()
+				continue
+			}
+			backendName := p.backendStmtName(msg.Name)
 			var existingSD *pgconn.StatementDescription
 			if msg.Name != "" {
-				existingSD = session.DB.GetStatementDescription(msg.Name)
+				existingSD = p.GetStatementDescription(msg.Name)
 			}
 			pgConn := session.DB.PgConn()
 			var sd *pgconn.StatementDescription
 			var prepErr error
 			session.DB.LockRun()
 			if msg.Name != "" && existingSD != nil && pgConn != nil {
-				_ = pgConn.Deallocate(context.Background(), msg.Name)
+				_ = pgConn.Deallocate(context.Background(), backendName)
 			}
 			if pgConn != nil {
-				sd, prepErr = pgConn.Prepare(context.Background(), msg.Name, interceptedQuery, msg.ParameterOIDs)
+				sd, prepErr = pgConn.Prepare(context.Background(), backendName, interceptedQuery, msg.ParameterOIDs)
 			} else {
 				prepErr = fmt.Errorf("conexão backend indisponível")
 			}
@@ -211,65 +217,79 @@ func (p *proxyConnection) RunMessageLoop(testID string) {
 				p.SendErrorResponse(prepErr)
 				continue
 			}
-			// SetStatementDescription uses Lock; call after UnlockRun to avoid deadlock.
-			session.DB.SetStatementDescription(msg.Name, sd)
+			p.SetStatementDescription(msg.Name, sd)
 			p.backend.Send(&pgproto3.ParseComplete{})
 			p.backend.Flush()
 
 		case *pgproto3.Bind:
-			// Store portal mapping locally. The actual Bind to PostgreSQL will happen when
-			// Execute arrives (via ExecPrepared which sends its own Bind).
-			if session := p.server.Pgtest.GetSession(testID); session != nil && session.DB != nil {
-				session.DB.BindPortal(msg.DestinationPortal, msg.PreparedStatement, msg.Parameters, msg.ParameterFormatCodes, msg.ResultFormatCodes)
-			}
+			// Store portal mapping per-connection. The actual Bind to PostgreSQL happens when
+			// Execute arrives (via ExecPrepared which uses backend-prefixed statement name).
+			p.BindPortal(msg.DestinationPortal, msg.PreparedStatement, msg.Parameters, msg.ParameterFormatCodes, msg.ResultFormatCodes)
 			p.backend.Send(&pgproto3.BindComplete{})
 			p.backend.Flush()
 
 		case *pgproto3.Execute:
-			// Execute the prepared statement via PgConn.ExecPrepared() which sends
-			// Bind+Describe(P)+Execute+Sync internally and returns a ResultReader.
-			// LockRun serializes use of the shared backend so concurrent connections don't get "conn busy".
+			// Execute the prepared statement via PgConn.ExecPrepared() using per-connection
+			// portal/statement state and backend-prefixed statement name. LockRun serializes backend use.
 			session := p.server.Pgtest.GetSession(testID)
 			if session == nil || session.DB == nil || session.DB.PgConn() == nil {
 				p.SendErrorResponse(fmt.Errorf("sessão não encontrada para testID: %s", testID))
 				continue
 			}
-			stmtName := session.DB.PortalStatementName(msg.Portal)
-			query, params, formatCodes, ok := session.DB.QueryForPortal(msg.Portal)
+			stmtName := p.PortalStatementName(msg.Portal)
+			query, params, formatCodes, ok := p.QueryForPortal(msg.Portal)
 			if !ok {
 				p.SendErrorResponse(fmt.Errorf("portal ou statement não encontrado para execução (portal=%q)", msg.Portal))
 				continue
 			}
-			// Record extended-query in session for GUI (last query + history), with params substituted for display.
-			if query != "" {
+			if query != "" && session.DB != nil {
 				args := bindParamsToArgs(params, formatCodes)
 				session.DB.SetLastQueryWithParams(query, args)
 			}
-			resultFormats := session.DB.PortalResultFormats(msg.Portal)
+			if p.IsMultiStatement(stmtName) {
+				// Run as batch and send only the last result (same behavior as Simple Query multi-statement).
+				commands := sql.SplitCommands(query)
+				if err := p.SafeForwardMultipleCommandsToDB(testID, commands, false); err != nil {
+					log.Printf("[PROXY] multi-statement Execute failed: %v", err)
+					p.SendErrorResponse(err)
+					recoverSessionTxAfterDirectExec(session)
+				}
+				continue
+			}
+			resultFormats := p.PortalResultFormats(msg.Portal)
 			pgConn := session.DB.PgConn()
+			backendStmtName := p.backendStmtName(stmtName)
 			session.DB.LockRun()
-			err = p.executeViaExecPrepared(context.Background(), pgConn, stmtName, params, formatCodes, resultFormats)
+			err = p.executeViaExecPrepared(context.Background(), pgConn, backendStmtName, params, formatCodes, resultFormats)
 			session.DB.UnlockRun()
 			if err != nil {
 				log.Printf("[PROXY] ExecPrepared failed: %v", err)
 				p.SendErrorResponse(err)
+				recoverSessionTxAfterDirectExec(session)
 			}
 
 		case *pgproto3.Describe:
-			// Use the cached StatementDescription from PgConn.Prepare() to respond with real
-			// ParameterDescription + RowDescription/NoData from PostgreSQL.
-			session := p.server.Pgtest.GetSession(testID)
-			if session == nil || session.DB == nil {
-				p.SendErrorResponse(fmt.Errorf("sessão não encontrada para testID: %s", testID))
+			// Use per-connection cached StatementDescription to respond with ParameterDescription + RowDescription/NoData.
+			// Multi-statement "prepared" queries have no backend SD; send empty params + NoData.
+			var stmtName string
+			if msg.ObjectType == 'S' {
+				stmtName = msg.Name
+			} else {
+				stmtName = p.PortalStatementName(msg.Name)
+			}
+			if p.IsMultiStatement(stmtName) {
+				p.backend.Send(&pgproto3.ParameterDescription{ParameterOIDs: nil})
+				p.backend.Send(&pgproto3.NoData{})
+				p.backend.Flush()
 				continue
 			}
 			var sd *pgconn.StatementDescription
 			var resultFormats []int16
 			if msg.ObjectType == 'S' {
-				sd = session.DB.GetStatementDescription(msg.Name)
+				sd = p.GetStatementDescription(msg.Name)
 			} else {
-				sd = session.DB.GetStatementDescriptionForPortal(msg.Name)
-				resultFormats = session.DB.PortalResultFormats(msg.Name)
+				sd = p.GetStatementDescriptionForPortal(msg.Name)
+				resultFormats = p.PortalResultFormats(msg.Name)
 			}
 			if sd == nil {
 				p.SendErrorResponse(fmt.Errorf("statement description not found for Describe (objectType=%c, name=%q)", msg.ObjectType, msg.Name))
@@ -291,20 +311,19 @@ func (p *proxyConnection) RunMessageLoop(testID string) {
 			p.backend.Flush()
 
 		case *pgproto3.Close:
-			// Deallocate the statement on PostgreSQL (for statement close) and clean up local state.
-			// LockRun serializes use of the shared backend so concurrent connections don't get "conn busy".
-			// Get PgConn before LockRun; PgConn() takes RLock and would deadlock if called under Lock.
+			// Deallocate on backend using connection-prefixed name (only if we prepared it); clean up per-connection maps.
 			session := p.server.Pgtest.GetSession(testID)
 			if session != nil && session.DB != nil {
 				pgConn := session.DB.PgConn()
-				if msg.ObjectType == 'S' && pgConn != nil {
+				if msg.ObjectType == 'S' && pgConn != nil && !p.IsMultiStatement(msg.Name) {
+					backendName := p.backendStmtName(msg.Name)
 					session.DB.LockRun()
-					if err := pgConn.Deallocate(context.Background(), msg.Name); err != nil {
+					if err := pgConn.Deallocate(context.Background(), backendName); err != nil {
 						log.Printf("[PROXY] Deallocate failed: %v", err)
 					}
 					session.DB.UnlockRun()
 				}
-				session.DB.CloseStatementOrPortal(msg.ObjectType, msg.Name)
+				p.CloseStatementOrPortal(msg.ObjectType, msg.Name)
 			}
 			p.backend.Send(&pgproto3.CloseComplete{})
 			p.backend.Flush()

@@ -8,6 +8,7 @@
 package integration
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"pgtest-sandbox/pkg/logger"
 	"pgtest-sandbox/pkg/postgres"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -361,6 +363,103 @@ func TestConcurrentConnectionsSameSession(t *testing.T) {
 		if results[i] != 1 {
 			t.Errorf("Connection %d result = %d, want 1", i+1, results[i])
 		}
+	}
+}
+
+// TestTwoConnectionsSamePreparedStatementName verifies that two different connections to the
+// same testID (session) can each prepare a statement with the same client-side name (e.g.
+// PDO's "pdo_stmt_00000004") without colliding. Previously they shared session-level maps
+// and the second Prepare would overwrite the first, causing "bind message supplies N parameters,
+// but prepared statement requires M" when the first connection executed.
+func TestTwoConnectionsSamePreparedStatementName(t *testing.T) {
+	testID := "test_same_stmt_name"
+	dsn := getPGTestProxyDSN(testID)
+	ctx := context.Background()
+
+	conn1, err := pgconn.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connection 1: %v", err)
+	}
+	defer conn1.Close(ctx)
+
+	conn2, err := pgconn.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connection 2: %v", err)
+	}
+	defer conn2.Close(ctx)
+
+	// Same statement name on both connections (PDO-style); different queries: one with 1 param, one with 0.
+	const stmtName = "pdo_stmt_00000004"
+	_, err = conn1.Prepare(ctx, stmtName, "SELECT $1::int", nil)
+	if err != nil {
+		t.Fatalf("conn1 Prepare: %v", err)
+	}
+	_, err = conn2.Prepare(ctx, stmtName, "SELECT 42", nil)
+	if err != nil {
+		t.Fatalf("conn2 Prepare: %v", err)
+	}
+
+	// Execute on conn1 with one parameter; must return 123 (not 42 and not "wrong parameter count").
+	rr1 := conn1.ExecPrepared(ctx, stmtName, [][]byte{[]byte("123")}, nil, nil)
+	var val1 int
+	if rr1.NextRow() {
+		vals := rr1.Values()
+		if len(vals) > 0 && vals[0] != nil {
+			fmt.Sscanf(string(vals[0]), "%d", &val1)
+		}
+	}
+	if _, err := rr1.Close(); err != nil {
+		t.Fatalf("conn1 ExecPrepared close: %v", err)
+	}
+	if val1 != 123 {
+		t.Errorf("conn1 result = %d, want 123 (collision would give 42 or wrong param count)", val1)
+	}
+
+	// Execute on conn2 with no parameters; must return 42.
+	rr2 := conn2.ExecPrepared(ctx, stmtName, nil, nil, nil)
+	var val2 int
+	if rr2.NextRow() {
+		vals := rr2.Values()
+		if len(vals) > 0 && vals[0] != nil {
+			fmt.Sscanf(string(vals[0]), "%d", &val2)
+		}
+	}
+	if _, err := rr2.Close(); err != nil {
+		t.Fatalf("conn2 ExecPrepared close: %v", err)
+	}
+	if val2 != 42 {
+		t.Errorf("conn2 result = %d, want 42", val2)
+	}
+}
+
+// TestMultipleQueriesReturnsLastOnly ensures the proxy returns only the last result for a
+// multi-statement Simple Query. Example: "SELECT 1 as val; SELECT 2 as val;" must return
+// a single row with val = 2, not 1.
+func TestMultipleQueriesReturnsLastOnly(t *testing.T) {
+	testID := "test_multi_last_only"
+	db := connectToPGTestProxySingleConn(t, testID)
+	defer db.Close()
+
+	execBegin(t, db, "")
+
+	rows, err := db.Query("SELECT 1 as val; SELECT 2 as val;")
+	if err != nil {
+		t.Fatalf("multi-query failed: %v", err)
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		t.Fatalf("expected exactly one row (last result), got 0")
+	}
+	var val int
+	if err := rows.Scan(&val); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if val != 2 {
+		t.Errorf("result val = %d, want 2 (must be last query result only)", val)
+	}
+	if rows.Next() {
+		t.Fatalf("expected exactly one row, got more (proxy must return last result only)")
 	}
 }
 

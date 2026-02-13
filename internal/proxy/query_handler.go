@@ -14,6 +14,18 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 )
 
+// recoverSessionTxAfterDirectExec rolls back the aborted transaction and starts a new one
+// after a direct backend execution failed (e.g. pgConn.Exec or ExecPrepared), so the next
+// command does not see "current transaction is aborted" (SQLSTATE 25P02).
+func recoverSessionTxAfterDirectExec(session *TestSession) {
+	if session == nil || session.DB == nil {
+		return
+	}
+	if err := session.DB.startNewTx(context.Background()); err != nil {
+		log.Printf("[PROXY] Recover tx after direct exec error: %v", err)
+	}
+}
+
 // ExecuteInterpretedQuery recebe uma query que já passou por parse e interceptação.
 // Ela decide se é comando único ou múltiplos comandos e encaminha para o banco.
 // args são os parâmetros bound (Extended Query); para Simple Query não passar args.
@@ -24,7 +36,7 @@ import (
 func (p *proxyConnection) ExecuteInterpretedQuery(testID string, query string, sendReadyForQuery bool, args ...any) error {
 	commands := sql.SplitCommands(query)
 	if len(commands) > 1 {
-		return p.ForwardMultipleCommandsToDB(testID, commands, sendReadyForQuery)
+		return p.SafeForwardMultipleCommandsToDB(testID, commands, sendReadyForQuery)
 	}
 	return p.ForwardCommandToDB(testID, query, sendReadyForQuery, args...)
 }
@@ -122,8 +134,12 @@ func (p *proxyConnection) ForwardCommandToDB(testID string, query string, sendRe
 	return nil
 }
 
-// ForwardMultipleCommandsToDB lida com strings contendo múltiplos comandos separados por ponto e vírgula.
-func (p *proxyConnection) ForwardMultipleCommandsToDB(testID string, commands []string, sendReadyForQuery bool) error {
+// SafeForwardMultipleCommandsToDB lida com strings contendo múltiplos comandos separados por ponto e vírgula.
+// Runs the whole batch inside a savepoint: either all commands succeed (RELEASE SAVEPOINT) or none apply (ROLLBACK TO SAVEPOINT).
+// The real transaction is never aborted; only the savepoint is rolled back on failure.
+func (p *proxyConnection) SafeForwardMultipleCommandsToDB(testID string, commands []string, sendReadyForQuery bool) error {
+	const multiCommandSavepointName = "pgtest_multi_guard"
+	ctx := context.Background()
 	session := p.server.Pgtest.GetSession(testID)
 	if session == nil {
 		return fmt.Errorf("sessão não encontrada para testID: '%s'", testID)
@@ -144,22 +160,31 @@ func (p *proxyConnection) ForwardMultipleCommandsToDB(testID string, commands []
 		fullQuery += ";"
 	}
 	session.DB.LockRun()
+	defer session.DB.UnlockRun()
 
-	mrr := pgConn.Exec(context.Background(), fullQuery)
+	// Guard the whole batch with a savepoint: all run or none.
+	if _, err := session.DB.execTxLocked(ctx, "SAVEPOINT "+multiCommandSavepointName); err != nil {
+		return fmt.Errorf("criar savepoint para múltiplos comandos: %w", err)
+	}
+
+	rollbackSavepoint := func() {
+		_, _ = session.DB.execTxLocked(ctx, "ROLLBACK TO SAVEPOINT "+multiCommandSavepointName+"; RELEASE SAVEPOINT "+multiCommandSavepointName)
+	}
+
+	mrr := pgConn.Exec(ctx, fullQuery)
 	defer mrr.Close()
 
 	// When we run our synthetic ROLLBACK (ROLLBACK TO SAVEPOINT; RELEASE SAVEPOINT), the client
 	// sent a single "ROLLBACK" and expects a single CommandComplete("ROLLBACK") + ReadyForQuery.
-	// We must not send two CommandComplete tags or the driver can hang.
 	isRollbackPair := len(commands) == 2 &&
 		strings.Contains(strings.ToUpper(strings.TrimSpace(commands[0])), "ROLLBACK TO SAVEPOINT ") &&
 		strings.Contains(strings.ToUpper(strings.TrimSpace(commands[1])), "RELEASE SAVEPOINT ")
 
-	var lastSelectResult *pgproto3.RowDescription
-	var lastSelectRows []*pgproto3.DataRow
-	var lastSelectTag []byte
+	// Track only the last command's result (may be a SELECT with rows, SELECT with no rows, or a non-SELECT).
+	var lastResultRowDesc *pgproto3.RowDescription
+	var lastResultRows []*pgproto3.DataRow
+	var lastResultTag []byte
 
-	// Itera sobre todos os resultados
 	for mrr.NextResult() {
 		rr := mrr.ResultReader()
 		if rr == nil {
@@ -168,16 +193,11 @@ func (p *proxyConnection) ForwardMultipleCommandsToDB(testID string, commands []
 
 		fieldDescs := rr.FieldDescriptions()
 		if len(fieldDescs) > 0 {
-			// É um SELECT. O protocolo simples do Postgres normalmente retorna apenas
-			// o resultado do último comando se forem múltiplos SELECTs, ou todos se o cliente suportar.
-			// Aqui acumulamos para enviar o último (comportamento comum de drivers simples).
+			// SELECT: keep this as the last result (rows may be empty).
 			fields := protocol.ConvertFieldDescriptions(fieldDescs)
-			rowDesc := &pgproto3.RowDescription{Fields: fields}
-			var rows []*pgproto3.DataRow
-
-			rowCount := 0
+			lastResultRowDesc = &pgproto3.RowDescription{Fields: fields}
+			lastResultRows = nil
 			for rr.NextRow() {
-				rowCount++
 				values := rr.Values()
 				valuesCopy := make([][]byte, len(values))
 				for i, v := range values {
@@ -186,60 +206,64 @@ func (p *proxyConnection) ForwardMultipleCommandsToDB(testID string, commands []
 						copy(valuesCopy[i], v)
 					}
 				}
-				rows = append(rows, &pgproto3.DataRow{Values: valuesCopy})
+				lastResultRows = append(lastResultRows, &pgproto3.DataRow{Values: valuesCopy})
 			}
-
 			tag, err := rr.Close()
 			if err != nil {
-				session.DB.UnlockRun()
+				rollbackSavepoint()
 				return fmt.Errorf("erro ao fechar result reader: %w", err)
 			}
-
-			if rowCount > 0 {
-				lastSelectResult = rowDesc
-				lastSelectRows = rows
-				lastSelectTag = []byte(tag.String())
-			}
+			lastResultTag = []byte(tag.String())
 		} else {
-			// Comando sem retorno de linhas (UPDATE, INSERT, SET, etc).
+			// Non-SELECT (UPDATE, INSERT, SET, etc): last result is just the tag.
+			lastResultRowDesc = nil
+			lastResultRows = nil
 			tag, err := rr.Close()
 			if err != nil {
-				session.DB.UnlockRun()
+				rollbackSavepoint()
 				return fmt.Errorf("erro ao fechar result reader: %w", err)
 			}
-			// For our rollback pair, do not send per-command tags; we send a single "ROLLBACK" below.
-			if !isRollbackPair {
-				if tagStr := tag.String(); tagStr != "" {
-					p.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(tagStr)})
-				}
-			}
+			lastResultTag = []byte(tag.String())
 		}
 	}
 
-	// Se houve algum SELECT com resultados, envia agora o último acumulado.
-	if lastSelectResult != nil {
-		p.backend.Send(lastSelectResult)
-		for _, row := range lastSelectRows {
+	// Send only the last command's result.
+	if isRollbackPair {
+		p.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("ROLLBACK")})
+	} else if lastResultRowDesc != nil {
+		p.backend.Send(lastResultRowDesc)
+		for _, row := range lastResultRows {
 			p.backend.Send(row)
 		}
-		p.backend.Send(&pgproto3.CommandComplete{CommandTag: lastSelectTag})
-	} else if isRollbackPair {
-		// Client sent one ROLLBACK; respond with one CommandComplete.
-		p.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("ROLLBACK")})
+		p.backend.Send(&pgproto3.CommandComplete{CommandTag: lastResultTag})
+	} else if len(lastResultTag) > 0 {
+		p.backend.Send(&pgproto3.CommandComplete{CommandTag: lastResultTag})
 	}
 
 	if err := mrr.Close(); err != nil {
-		session.DB.UnlockRun()
+		rollbackSavepoint()
 		return fmt.Errorf("erro ao processar múltiplos resultados: %w", err)
 	}
 
-	// Release run lock before TCL tracking: ApplyTCLSuccessTracking calls DecrementSavepointLevel etc., which take session.DB.mu.
-	session.DB.UnlockRun()
+	// All commands succeeded; release savepoint so changes are kept.
+	_, secondGuardErr := session.DB.execTxLocked(ctx, "SAVEPOINT "+multiCommandSavepointName+"_inside")
+	if secondGuardErr == nil {
+		_, firstGuardErr := session.DB.execTxLocked(ctx, "RELEASE SAVEPOINT "+multiCommandSavepointName) //It can fail due to rollback before this point
+		if firstGuardErr != nil {
+			_, errRollbackSecondGuard := session.DB.execTxLocked(ctx, "ROLLBACK TO SAVEPOINT "+multiCommandSavepointName+"_inside; RELEASE SAVEPOINT "+multiCommandSavepointName+"_inside")
+			if errRollbackSecondGuard != nil {
+				return fmt.Errorf("erro ao executar ROLLBACK TO SAVEPOINT e RELEASE SAVEPOINT: %w", errRollbackSecondGuard)
+			}
+		}
+	} else {
+		return fmt.Errorf("erro ao executar RELEASE SAVEPOINT: %w", secondGuardErr)
+	}
 
 	// Apply TCL side effects (e.g. ROLLBACK ...; RELEASE ... from handleRollback) so session level stays in sync.
+	// Use Locked variant: caller holds LockRun (d.mu), so we must not call session.DB methods that take d.mu again.
 	for _, cmd := range commands {
 		if trimmed := strings.TrimSpace(cmd); trimmed != "" {
-			_ = p.ApplyTCLSuccessTracking(trimmed, session)
+			_ = p.ApplyTCLSuccessTrackingLocked(trimmed, session)
 		}
 	}
 

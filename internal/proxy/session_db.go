@@ -73,9 +73,29 @@ func (d *realSessionDB) IncrementSavepointLevel() {
 func (d *realSessionDB) DecrementSavepointLevel() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.decrementSavepointLevelLocked()
+}
+
+// DecrementSavepointLevel decrements the savepoint level. Call only after a RELEASE SAVEPOINT or ROLLBACK TO SAVEPOINT has been successfully executed. No-op if level is already 0.
+func (d *realSessionDB) decrementSavepointLevelLocked() {
 	if d.SavepointLevel > 0 {
 		d.SavepointLevel--
 	}
+}
+
+// getSavepointNameLocked returns the name for the current savepoint level. Caller must hold d.mu.
+func (d *realSessionDB) getSavepointNameLocked() string {
+	return fmt.Sprintf("pgtest_v_%d", d.SavepointLevel)
+}
+
+// getNextSavepointNameLocked returns the name for the next SAVEPOINT (current level + 1) without incrementing. Caller must hold d.mu.
+func (d *realSessionDB) getNextSavepointNameLocked() string {
+	return fmt.Sprintf("pgtest_v_%d", d.SavepointLevel+1)
+}
+
+// incrementSavepointLevelLocked increments the savepoint level. Caller must hold d.mu.
+func (d *realSessionDB) incrementSavepointLevelLocked() {
+	d.SavepointLevel++
 }
 
 // LockRun holds d.mu for the duration of using the backend outside SafeExec/SafeQuery/SafeExecTCL (e.g. PgConn().Exec). Unlock with UnlockRun.
@@ -86,6 +106,16 @@ func (d *realSessionDB) LockRun() {
 // UnlockRun releases d.mu held by LockRun.
 func (d *realSessionDB) UnlockRun() {
 	d.mu.Unlock()
+}
+
+// execTxLocked runs a single SQL command on d.tx. Caller must hold d.mu (e.g. via LockRun).
+// Used to run SAVEPOINT/ROLLBACK TO SAVEPOINT/RELEASE SAVEPOINT around a batch without releasing the lock.
+func (d *realSessionDB) execTxLocked(ctx context.Context, sql string) (pgconn.CommandTag, error) {
+	if d.tx == nil {
+		return pgconn.CommandTag{}, fmt.Errorf("no active transaction")
+	}
+	tag, err := d.tx.Exec(ctx, sql)
+	return tag, err
 }
 
 // hasOpenUserTransaction returns true when any connection has an open user transaction.
@@ -137,6 +167,10 @@ func (d *realSessionDB) ClaimOpenTransaction(connID ConnectionID) error {
 func (d *realSessionDB) ReleaseOpenTransaction(connID ConnectionID) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.releaseOpenTransactionLocked(connID)
+}
+
+func (d *realSessionDB) releaseOpenTransactionLocked(connID ConnectionID) {
 	if d.connectionWithOpenTx == connID {
 		d.connectionWithOpenTx = 0
 	}

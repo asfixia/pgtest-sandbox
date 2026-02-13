@@ -101,14 +101,12 @@ func (p *PGTest) GetOrCreateSession(testID string) (*TestSession, error) {
 	if session, exists := p.SessionsByTestID[testID]; exists {
 		session.mu.Lock()
 		session.LastActivity = time.Now()
+		session.mu.Unlock()
 		// Verifica se a conexão ainda está válida
 		if session.DB == nil || session.DB.PgConn() == nil {
-			session.mu.Unlock()
 			// Remove sessão inválida e cria nova
 			delete(p.SessionsByTestID, testID)
 		} else {
-			session.mu.Unlock()
-			p.mu.Unlock()
 			return session, nil
 		}
 	}
