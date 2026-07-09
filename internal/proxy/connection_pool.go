@@ -19,6 +19,7 @@ import (
 // host, user, password, database, and application_name can safely contain spaces and
 // special characters without manual escaping.
 func newConnectionForTestID(host string, port int, database string, user string, password string, sessionTimeout time.Duration, testID string) (*pgx.Conn, error) {
+	//#TODO (IA MANTER ISSO AQUI) Danilo Quero revisar se tirar os set env.
 	appName := getAppNameForTestID(testID)
 	u := &url.URL{
 		Scheme: "postgres",
@@ -65,8 +66,15 @@ func newConnectionForTestID(host string, port int, database string, user string,
 }
 
 func getAppNameForTestID(testID string) string {
+	var name string
 	if testID == "default" {
-		return "pgrollback_default"
+		name = "pgrollback_default"
+	} else {
+		name = fmt.Sprintf("pgrollback-%s", testID)
 	}
-	return fmt.Sprintf("pgrollback-%s", testID)
+	// PostgreSQL truncates application_name to NAMEDATALEN-1 (63 bytes).
+	if len(name) > 63 {
+		name = name[:63]
+	}
+	return name
 }
