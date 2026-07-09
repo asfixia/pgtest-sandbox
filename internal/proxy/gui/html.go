@@ -150,6 +150,31 @@ const htmlTemplate = `<!DOCTYPE html>
     }
     .tx-status.yes { color: #38bdf8; }
     .tx-status.no { color: #64748b; }
+    .lock-status {
+      width: 8rem;
+      font-size: 0.8125rem;
+      font-weight: 500;
+      white-space: nowrap;
+    }
+    .lock-status.ok { color: #64748b; }
+    .lock-status.blocked {
+      color: #fb923c;
+    }
+    .lock-status.blocked .lock-badge {
+      display: inline-block;
+      padding: 0.15rem 0.45rem;
+      border-radius: 999px;
+      background: rgba(249, 115, 22, 0.18);
+      border: 1px solid rgba(251, 146, 60, 0.55);
+      color: #fdba74;
+      font-size: 0.75rem;
+      letter-spacing: 0.02em;
+    }
+    .lock-status.blocked.pgrollback .lock-badge {
+      background: rgba(56, 189, 248, 0.12);
+      border-color: rgba(56, 189, 248, 0.45);
+      color: #7dd3fc;
+    }
     .query {
       max-width: 42rem;
       overflow: hidden;
@@ -343,7 +368,7 @@ const htmlTemplate = `<!DOCTYPE html>
     </header>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Test ID</th><th class="tx-status">In transaction</th><th>Last query</th><th class="actions">Actions</th></tr></thead>
+        <thead><tr><th>Test ID</th><th class="tx-status">In transaction</th><th class="lock-status">Lock</th><th>Last query</th><th class="actions">Actions</th></tr></thead>
         <tbody id="tbody"></tbody>
       </table>
     </div>
@@ -517,7 +542,31 @@ const htmlTemplate = `<!DOCTYPE html>
     var openHistoryIds = {};
     var historyScrollTops = {};
     var lastRenderedSessions = null;
-    function sessionKeys(sessions) {
+    function lockStatusHtml(s) {
+      var ls = s && s.lock_status;
+      if (!ls || ls.waiting_on_lock !== true) {
+        return '<span class="lock-status ok" title="Not waiting on a lock">—</span>';
+      }
+      var parts = ['Waiting on lock'];
+      if (ls.locked_relation) parts.push('relation: ' + ls.locked_relation);
+      if (ls.lock_mode) parts.push('mode: ' + ls.lock_mode);
+      if (ls.wait_event) parts.push('wait: ' + ls.wait_event);
+      if (ls.blocker_pid) parts.push('blocked by PID ' + ls.blocker_pid);
+      if (ls.blocker_is_pgrollback && ls.blocker_test_id) {
+        parts.push('blocker: pgrollback session ' + ls.blocker_test_id);
+      } else if (ls.blocker_application_name) {
+        parts.push('blocker app: ' + ls.blocker_application_name);
+      }
+      if (ls.blocker_query_snippet) parts.push('blocker query: ' + ls.blocker_query_snippet);
+      var title = parts.join('\\n');
+      var label = 'Blocked';
+      var extraClass = '';
+      if (ls.blocker_is_pgrollback && ls.blocker_test_id) {
+        label = 'Blocked by pgrollback';
+        extraClass = ' pgrollback';
+      }
+      return '<span class="lock-status blocked' + extraClass + '" title="' + escapeHtml(title) + '"><span class="lock-badge">' + escapeHtml(label) + '</span></span>';
+    }
       var ids = [];
       for (var i = 0; i < sessions.length; i++) ids.push(sessions[i].test_id);
       ids.sort();
@@ -534,8 +583,8 @@ const htmlTemplate = `<!DOCTYPE html>
         var n = hist.length;
         var txLabel = (s.in_transaction === true) ? 'Yes' : 'No';
         var txClass = (s.in_transaction === true) ? 'tx-status yes' : 'tx-status no';
-        html += '<tr class="session-row" data-id="' + escapeHtml(s.test_id) + '"><td>' + escapeHtml(s.test_id) + '</td><td class="' + txClass + '">' + txLabel + '</td><td class="query" title="' + escapeHtml(qTitle) + '">' + q + dur + '</td><td><button type="button" class="history-btn" data-id="' + escapeHtml(s.test_id) + '">History (' + n + ')</button><button type="button" class="clear-log-btn" data-id="' + escapeHtml(s.test_id) + '">Clear log</button><button type="button" class="close-btn" data-id="' + escapeHtml(s.test_id) + '">Disconnect</button></td></tr>';
-        html += '<tr class="history-row" data-id="' + escapeHtml(s.test_id) + '" style="display:none"><td colspan="4"><div class="history-list-wrap"><div class="history-list-toolbar"><button type="button" class="history-height-btn">Full height</button></div><div class="history-list"><ul>';
+        html += '<tr class="session-row" data-id="' + escapeHtml(s.test_id) + '"><td>' + escapeHtml(s.test_id) + '</td><td class="' + txClass + '">' + txLabel + '</td><td>' + lockStatusHtml(s) + '</td><td class="query" title="' + escapeHtml(qTitle) + '">' + q + dur + '</td><td><button type="button" class="history-btn" data-id="' + escapeHtml(s.test_id) + '">History (' + n + ')</button><button type="button" class="clear-log-btn" data-id="' + escapeHtml(s.test_id) + '">Clear log</button><button type="button" class="close-btn" data-id="' + escapeHtml(s.test_id) + '">Disconnect</button></td></tr>';
+        html += '<tr class="history-row" data-id="' + escapeHtml(s.test_id) + '" style="display:none"><td colspan="5"><div class="history-list-wrap"><div class="history-list-toolbar"><button type="button" class="history-height-btn">Full height</button></div><div class="history-list"><ul>';
         for (var j = 0; j < hist.length; j++) {
           html += '<li>' + historyItemHtml(hist[j]) + '</li>';
         }
@@ -603,7 +652,8 @@ const htmlTemplate = `<!DOCTYPE html>
       var txLabel = (s.in_transaction === true) ? 'Yes' : 'No';
       mainRow.cells[1].textContent = txLabel;
       mainRow.cells[1].className = (s.in_transaction === true) ? 'tx-status yes' : 'tx-status no';
-      var queryCell = mainRow.cells[2];
+      if (mainRow.cells[2]) mainRow.cells[2].innerHTML = lockStatusHtml(s);
+      var queryCell = mainRow.cells[3];
       queryCell.innerHTML = escapeHtml(q) + dur;
       queryCell.title = q;
       queryCell.className = 'query';
@@ -651,7 +701,7 @@ const htmlTemplate = `<!DOCTYPE html>
         }
       }
       if (sessions.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" class="empty">No sessions</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="empty">No sessions</td></tr>';
         lastRenderedSessions = null;
         if (settingsModalOpen && settingsModal) settingsModal.classList.add('visible');
         return;

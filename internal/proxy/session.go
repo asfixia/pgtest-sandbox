@@ -132,6 +132,9 @@ type PgRollback struct {
 
 	// Events broadcasts session/query lifecycle events to GUI subscribers (e.g. the SSE stream).
 	Events *gui.Hub
+
+	lockInspector     *lockInspector
+	lockInspectorOnce sync.Once
 }
 
 // GetLastQueryDuration returns the last query execution duration (e.g. "12.345ms") for GUI, derived from the last history entry.
@@ -254,6 +257,17 @@ func NewPgRollback(postgresHost string, postgresPort int, postgresDB, postgresUs
 // entry). Returns false if the session does not exist. Safe to call while a query is running on
 // that session (no field read here takes the query-execution lock).
 func (p *PgRollback) SessionInfoFor(testID string) (gui.SessionInfo, bool) {
+	info, ok := p.sessionInfoWithoutLockStatus(testID)
+	if !ok {
+		return gui.SessionInfo{}, false
+	}
+	p.enrichLockStatusForSession(&info)
+	return info, true
+}
+
+// sessionInfoWithoutLockStatus builds SessionInfo without querying pg_locks (used by GetSessions
+// to batch lock lookups in one inspector round-trip).
+func (p *PgRollback) sessionInfoWithoutLockStatus(testID string) (gui.SessionInfo, bool) {
 	session := p.GetSession(testID)
 	if session == nil {
 		return gui.SessionInfo{}, false

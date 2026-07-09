@@ -212,7 +212,7 @@ func AssertRowCountWithCondition(t *testing.T, executor DBExecutor, tableName st
 // TableExistsInPublic reports whether tableName exists in schema public.
 // Uses to_regclass (single catalog lookup) instead of scanning information_schema.
 func TableExistsInPublic(ctx context.Context, executor DBExecutor, tableName string) (bool, error) {
-	const query = `SELECT to_regclass(format('%I.%I', 'public', $1)) IS NOT NULL`
+	const query = `SELECT to_regclass(format('%I.%I', 'public', $1::text)) IS NOT NULL`
 	row := queryRow(ctx, executor, query, tableName)
 	var exists bool
 	err := scanRow(row, &exists)

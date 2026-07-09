@@ -8,10 +8,26 @@ type QueryHistoryItem struct {
 	Running  bool   `json:"running"`  // true from the moment the query is logged until it finishes (success or error)
 }
 
+// LockStatus describes whether a session backend is waiting on a PostgreSQL lock and who blocks it.
+// Populated via read-only catalog queries (pg_locks / pg_stat_activity) on a separate inspector connection.
+type LockStatus struct {
+	WaitingOnLock          bool   `json:"waiting_on_lock"`
+	WaitEventType          string `json:"wait_event_type,omitempty"`
+	WaitEvent              string `json:"wait_event,omitempty"`
+	LockedRelation         string `json:"locked_relation,omitempty"`
+	LockMode               string `json:"lock_mode,omitempty"`
+	BlockerPID             int32  `json:"blocker_pid,omitempty"`
+	BlockerApplicationName string `json:"blocker_application_name,omitempty"`
+	BlockerIsPgrollback    bool   `json:"blocker_is_pgrollback"`
+	BlockerTestID          string `json:"blocker_test_id,omitempty"` // set when BlockerIsPgrollback is true
+	BlockerQuerySnippet    string `json:"blocker_query_snippet,omitempty"`
+}
+
 // SessionInfo is the JSON shape for one session in the GUI API.
 type SessionInfo struct {
 	TestID            string             `json:"test_id"`
 	InTransaction     bool               `json:"in_transaction"`     // true if session has an active (open) transaction
+	LockStatus        *LockStatus        `json:"lock_status,omitempty"`
 	LastQuery         string             `json:"last_query"`
 	LastQueryDuration string             `json:"last_query_duration"` // e.g. "12.345ms" for GUI display
 	Running           bool               `json:"running"`             // true while the most recent query is still executing

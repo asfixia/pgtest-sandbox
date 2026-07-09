@@ -16,10 +16,11 @@ func (a *sessionProviderAdapter) GetSessions() []gui.SessionInfo {
 	sessions := a.s.PgRollback.GetAllSessions()
 	list := make([]gui.SessionInfo, 0, len(sessions))
 	for testID := range sessions {
-		if info, ok := a.s.PgRollback.SessionInfoFor(testID); ok {
+		if info, ok := a.s.PgRollback.sessionInfoWithoutLockStatus(testID); ok {
 			list = append(list, info)
 		}
 	}
+	a.s.PgRollback.enrichSessionsLockStatus(list)
 	return list
 }
 
