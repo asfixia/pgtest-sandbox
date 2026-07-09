@@ -16,6 +16,16 @@ type mockProvider struct {
 	clearedHistory []string
 	destroyErr     error
 	clearErr       error
+	hub            *Hub
+}
+
+// Subscribe lazily creates a Hub so tests that don't care about events still satisfy
+// SessionProvider; tests that do care can call mockProvider.hub.Publish directly.
+func (m *mockProvider) Subscribe() (<-chan Event, func()) {
+	if m.hub == nil {
+		m.hub = NewHub()
+	}
+	return m.hub.Subscribe(8)
 }
 
 func (m *mockProvider) GetSessions() []SessionInfo {
@@ -288,7 +298,7 @@ func TestSessionInfo_JSONShape(t *testing.T) {
 	}
 	s := string(data)
 	// Check that JSON keys match the expected shape
-	for _, key := range []string{`"test_id"`, `"in_transaction"`, `"last_query"`, `"last_query_duration"`, `"query_history"`, `"query"`, `"at"`, `"duration"`} {
+	for _, key := range []string{`"test_id"`, `"in_transaction"`, `"last_query"`, `"last_query_duration"`, `"running"`, `"query_history"`, `"query"`, `"at"`, `"duration"`} {
 		if !strings.Contains(s, key) {
 			t.Errorf("JSON missing key %s: %s", key, s)
 		}

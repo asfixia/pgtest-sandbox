@@ -6,10 +6,15 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// MetadataQueryTimeout bounds catalog/metadata lookups (table existence, etc.).
+// These reads can block when DDL or long transactions hold locks on pg_catalog.
+const MetadataQueryTimeout = 5 * time.Second
 
 // DBExecutor é uma interface comum para executar queries SQL.
 // Aceita tanto *sql.DB quanto pgx.Tx através de type assertion.
@@ -204,20 +209,24 @@ func AssertRowCountWithCondition(t *testing.T, executor DBExecutor, tableName st
 	}
 }
 
-// AssertTableExists verifica que a tabela existe usando information_schema.
+// TableExistsInPublic reports whether tableName exists in schema public.
+// Uses to_regclass (single catalog lookup) instead of scanning information_schema.
+func TableExistsInPublic(ctx context.Context, executor DBExecutor, tableName string) (bool, error) {
+	const query = `SELECT to_regclass(format('%I.%I', 'public', $1)) IS NOT NULL`
+	row := queryRow(ctx, executor, query, tableName)
+	var exists bool
+	err := scanRow(row, &exists)
+	return exists, err
+}
+
+// AssertTableExists verifica que a tabela existe no schema public.
 // Funciona tanto com *sql.DB quanto com *pgx.Tx.
 func AssertTableExists(t *testing.T, executor DBExecutor, tableName string, contextMsg string) {
 	t.Helper()
-	checkQuery := `
-		SELECT EXISTS (
-			SELECT FROM information_schema.tables 
-			WHERE table_name = $1
-		)
-	`
-	ctx := context.Background()
-	row := queryRow(ctx, executor, checkQuery, tableName)
-	var exists bool
-	err := scanRow(row, &exists)
+	ctx, cancel := context.WithTimeout(context.Background(), MetadataQueryTimeout)
+	defer cancel()
+
+	exists, err := TableExistsInPublic(ctx, executor, tableName)
 	if err != nil {
 		msg := fmt.Sprintf("Failed to check if table %s exists", tableName)
 		if contextMsg != "" {

@@ -2,11 +2,71 @@ package gui
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"pgrollback/internal/config"
 )
+
+const sseHeartbeatInterval = 15 * time.Second
+
+// handleAPISessionsStream serves the session/query event stream over SSE. It writes an initial
+// "snapshot" frame so the client can paint immediately, then forwards events published via
+// provider.Subscribe() as they happen (query started/finished, session created/destroyed, etc.)
+// instead of the client polling GET /api/sessions on a timer.
+func handleAPISessionsStream(provider SessionProvider) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+
+		writeEvent := func(e Event) bool {
+			data, err := json.Marshal(e)
+			if err != nil {
+				return true
+			}
+			if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", e.Type, data); err != nil {
+				return false
+			}
+			flusher.Flush()
+			return true
+		}
+
+		if !writeEvent(Event{Type: EventSnapshot, Sessions: provider.GetSessions()}) {
+			return
+		}
+
+		ch, unsubscribe := provider.Subscribe()
+		defer unsubscribe()
+
+		ticker := time.NewTicker(sseHeartbeatInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case e := <-ch:
+				if !writeEvent(e) {
+					return
+				}
+			case <-ticker.C:
+				if _, err := fmt.Fprint(w, ": heartbeat\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			}
+		}
+	}
+}
 
 // ConfigResponse is the config returned by GET /api/config.
 // PostgresConnectionStringMasked is always derived from the same in-memory postgres settings as the proxy (via config.PostgresConnStringMasked), not stored separately.

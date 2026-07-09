@@ -113,6 +113,44 @@ func TestSetLastQuery_SkipsEmpty(t *testing.T) {
 	}
 }
 
+// --- Running state ---
+
+// TestSetLastQuery_MarksRunning verifies a query is logged as Running the moment it starts,
+// before any result is known, so the GUI can show it as in-flight (and detect a stale/stuck one).
+func TestSetLastQuery_MarksRunning(t *testing.T) {
+	db := newTestSessionDB()
+	db.Gui.SetLastQuery("SELECT pg_sleep(10)")
+	hist := db.Gui.GetQueryHistory()
+	if len(hist) != 1 {
+		t.Fatalf("history len = %d, want 1", len(hist))
+	}
+	if !hist[0].Running {
+		t.Error("Running = false right after SetLastQuery, want true")
+	}
+	if hist[0].Duration != "" {
+		t.Errorf("Duration = %q right after SetLastQuery, want empty", hist[0].Duration)
+	}
+}
+
+// TestUpdateLastQueryHistoryDuration_ClearsRunning verifies the state flips to "finished" on
+// completion. Callers use defer for this call so it also fires on an error return, which is the
+// regression case: a failed query must not stay stuck showing as Running forever.
+func TestUpdateLastQueryHistoryDuration_ClearsRunning(t *testing.T) {
+	db := newTestSessionDB()
+	db.Gui.SetLastQuery("SELECT 1")
+	db.Gui.UpdateLastQueryHistoryDuration(5 * time.Millisecond)
+	hist := db.Gui.GetQueryHistory()
+	if len(hist) != 1 {
+		t.Fatalf("history len = %d, want 1", len(hist))
+	}
+	if hist[0].Running {
+		t.Error("Running = true after UpdateLastQueryHistoryDuration, want false")
+	}
+	if hist[0].Duration != "5ms" {
+		t.Errorf("Duration = %q, want %q", hist[0].Duration, "5ms")
+	}
+}
+
 // --- Query history ordering ---
 
 func TestQueryHistory_ExecutionOrder(t *testing.T) {

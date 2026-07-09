@@ -12,6 +12,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
+
+	"pgrollback/internal/proxy/gui"
 )
 
 // BackendStartupCache holds ParameterStatus and BackendKeyData from the real PostgreSQL
@@ -127,6 +129,9 @@ type PgRollback struct {
 
 	// backendStartupCache is filled from the first real PostgreSQL connection and replayed to clients.
 	backendStartupCache *BackendStartupCache
+
+	// Events broadcasts session/query lifecycle events to GUI subscribers (e.g. the SSE stream).
+	Events *gui.Hub
 }
 
 // GetLastQueryDuration returns the last query execution duration (e.g. "12.345ms") for GUI, derived from the last history entry.
@@ -241,7 +246,72 @@ func NewPgRollback(postgresHost string, postgresPort int, postgresDB, postgresUs
 		Timeout:           timeout,
 		SessionTimeout:    sessionTimeout,
 		KeepaliveInterval: keepaliveInterval,
+		Events:            gui.NewHub(),
 	}
+}
+
+// SessionInfoFor builds the GUI snapshot for one session (same shape as GetSessions' per-session
+// entry). Returns false if the session does not exist. Safe to call while a query is running on
+// that session (no field read here takes the query-execution lock).
+func (p *PgRollback) SessionInfoFor(testID string) (gui.SessionInfo, bool) {
+	session := p.GetSession(testID)
+	if session == nil {
+		return gui.SessionInfo{}, false
+	}
+	inTransaction := false
+	lastQuery := ""
+	running := false
+	var queryHistory []gui.QueryHistoryItem
+	lastQueryDuration := session.GetLastQueryDuration()
+	if session.DB != nil {
+		inTransaction = session.DB.HasOpenUserTransaction()
+		lastQuery = session.DB.Gui.GetLastQuery()
+		entries := session.DB.Gui.GetQueryHistory()
+		queryHistory = make([]gui.QueryHistoryItem, len(entries))
+		for i, e := range entries {
+			queryHistory[i] = gui.QueryHistoryItem{Query: e.Query, At: e.At.Format(time.RFC3339), Duration: e.Duration, Running: e.Running}
+		}
+		if n := len(queryHistory); n > 0 {
+			running = queryHistory[n-1].Running
+		}
+	}
+	return gui.SessionInfo{
+		TestID:            testID,
+		InTransaction:     inTransaction,
+		LastQuery:         lastQuery,
+		LastQueryDuration: lastQueryDuration,
+		Running:           running,
+		QueryHistory:      queryHistory,
+	}, true
+}
+
+// PublishSessionUpdate emits an EventSessionUpdate for testID (e.g. query started/finished,
+// history cleared). No-op if the session no longer exists or Events is unset (e.g. in tests).
+func (p *PgRollback) PublishSessionUpdate(testID string) {
+	if p.Events == nil {
+		return
+	}
+	info, ok := p.SessionInfoFor(testID)
+	if !ok {
+		return
+	}
+	p.Events.Publish(gui.Event{Type: gui.EventSessionUpdate, Session: &info})
+}
+
+// PublishSnapshot emits an EventSnapshot with the full current session list (e.g. session
+// created/destroyed). No-op if Events is unset (e.g. in tests).
+func (p *PgRollback) PublishSnapshot() {
+	if p.Events == nil {
+		return
+	}
+	sessions := p.GetAllSessions()
+	list := make([]gui.SessionInfo, 0, len(sessions))
+	for testID := range sessions {
+		if info, ok := p.SessionInfoFor(testID); ok {
+			list = append(list, info)
+		}
+	}
+	p.Events.Publish(gui.Event{Type: gui.EventSnapshot, Sessions: list})
 }
 
 // GetOrCreateSession obtém uma sessão existente ou cria uma nova para o testID
@@ -287,6 +357,7 @@ func (p *PgRollback) GetOrCreateSession(testID string) (*TestSession, error) {
 		if err != nil {
 			return nil, err
 		}
+		p.PublishSnapshot()
 		return newSession, nil
 	}
 }
@@ -499,6 +570,7 @@ func (p *PgRollback) destroySessionCore(session *TestSession, testID string) err
 	if destroyWaitCh != nil {
 		close(destroyWaitCh)
 	}
+	p.PublishSnapshot()
 	return err
 }
 

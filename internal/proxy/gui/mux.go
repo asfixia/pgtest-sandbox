@@ -12,6 +12,7 @@ func NewMux(provider SessionProvider) http.Handler {
 	mux.HandleFunc("/gui", serveHome)
 	mux.HandleFunc("/gui/", serveHome)
 	mux.HandleFunc("/api/sessions", handleAPISessions(provider))
+	mux.HandleFunc("/api/sessions/stream", handleAPISessionsStream(provider))
 	mux.HandleFunc("/api/sessions/close", handleAPISessionsClose(provider))
 	mux.HandleFunc("/api/sessions/clear-history", handleAPISessionsClearHistory(provider))
 	mux.HandleFunc("/api/sessions/rollback-all", handleAPISessionsRollbackAll(provider))

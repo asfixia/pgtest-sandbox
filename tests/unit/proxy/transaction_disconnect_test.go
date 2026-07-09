@@ -165,11 +165,9 @@ func TestDisconnectWithoutCommitTableGone(t *testing.T) {
 	db2 := openDBToProxy(t, proxyServer.ListenHost(), proxyServer.ListenPort(), cfg, "pgrollback_"+testID)
 	defer db2.Close()
 
-	var exists bool
-	err := db2.QueryRowContext(ctx,
-		"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)",
-		tableName,
-	).Scan(&exists)
+	checkCtx, checkCancel := context.WithTimeout(ctx, testutil.MetadataQueryTimeout)
+	defer checkCancel()
+	exists, err := testutil.TableExistsInPublic(checkCtx, db2, tableName)
 	if err != nil {
 		t.Fatalf("Failed to check table existence: %v", err)
 	}
@@ -233,11 +231,9 @@ func TestBeginCommitCreateThenSessionDisconnectTableGone(t *testing.T) {
 	db2 := openDBToProxy(t, proxyServer.ListenHost(), proxyServer.ListenPort(), cfg, "pgrollback_"+testID)
 	defer db2.Close()
 
-	var exists bool
-	err := db2.QueryRowContext(ctx,
-		"SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1)",
-		tableName,
-	).Scan(&exists)
+	checkCtx, checkCancel := context.WithTimeout(ctx, testutil.MetadataQueryTimeout)
+	defer checkCancel()
+	exists, err := testutil.TableExistsInPublic(checkCtx, db2, tableName)
 	if err != nil {
 		t.Fatalf("check table existence: %v", err)
 	}

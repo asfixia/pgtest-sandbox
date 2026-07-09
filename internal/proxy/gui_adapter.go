@@ -3,7 +3,6 @@ package proxy
 import (
 	"fmt"
 	"net/http"
-	"time"
 
 	"pgrollback/internal/proxy/gui"
 )
@@ -16,29 +15,18 @@ type sessionProviderAdapter struct {
 func (a *sessionProviderAdapter) GetSessions() []gui.SessionInfo {
 	sessions := a.s.PgRollback.GetAllSessions()
 	list := make([]gui.SessionInfo, 0, len(sessions))
-	for testID, session := range sessions {
-		inTransaction := false
-		lastQuery := ""
-		var queryHistory []gui.QueryHistoryItem
-		lastQueryDuration := session.GetLastQueryDuration()
-		if session.DB != nil {
-			inTransaction = session.DB.HasOpenUserTransaction()
-			lastQuery = session.DB.Gui.GetLastQuery()
-			entries := session.DB.Gui.GetQueryHistory()
-			queryHistory = make([]gui.QueryHistoryItem, len(entries))
-			for i, e := range entries {
-				queryHistory[i] = gui.QueryHistoryItem{Query: e.Query, At: e.At.Format(time.RFC3339), Duration: e.Duration}
-			}
+	for testID := range sessions {
+		if info, ok := a.s.PgRollback.SessionInfoFor(testID); ok {
+			list = append(list, info)
 		}
-		list = append(list, gui.SessionInfo{
-			TestID:            testID,
-			InTransaction:     inTransaction,
-			LastQuery:         lastQuery,
-			LastQueryDuration: lastQueryDuration,
-			QueryHistory:      queryHistory,
-		})
 	}
 	return list
+}
+
+// Subscribe forwards to the PgRollback event hub so the SSE handler can stream session/query
+// lifecycle events without polling.
+func (a *sessionProviderAdapter) Subscribe() (<-chan gui.Event, func()) {
+	return a.s.PgRollback.Events.Subscribe(32)
 }
 
 func (a *sessionProviderAdapter) DestroySession(testID string) error {
@@ -53,6 +41,7 @@ func (a *sessionProviderAdapter) ClearHistory(testID string) error {
 	if session.DB != nil {
 		session.DB.Gui.ClearQueryHistory()
 	}
+	a.s.PgRollback.PublishSessionUpdate(testID)
 	return nil
 }
 

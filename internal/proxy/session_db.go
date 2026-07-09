@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -46,6 +47,7 @@ type realSessionDB struct {
 	Gui                  guiState     // GUI-observable state; see guiState doc
 	SavepointLevel       int
 	connectionWithOpenTx ConnectionID // which connection has the open user transaction; 0 when none (mu)
+	inUserTx             atomic.Bool  // mirrors connectionWithOpenTx != 0; lets GUI reads skip mu entirely (see HasOpenUserTransaction)
 	stopKeepalive        func()
 	ctx                  context.Context
 }
@@ -168,11 +170,11 @@ func (d *realSessionDB) runWithSavepointGuardLocked(ctx context.Context, savepoi
 }
 
 // HasOpenUserTransaction returns true if a connection has started a user transaction (BEGIN)
-// and not yet committed or rolled back.
+// and not yet committed or rolled back. Reads inUserTx instead of taking mu, so GUI/status
+// polling never blocks behind a running query (SafeQuery/SafeExec/SafeExecTCL hold mu for the
+// whole query). inUserTx is kept in sync with connectionWithOpenTx at its only two write sites.
 func (d *realSessionDB) HasOpenUserTransaction() bool {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return d.connectionWithOpenTx != 0
+	return d.inUserTx.Load()
 }
 
 // isTransactionHeldByOtherConnection returns true when a connection other than connID has the open transaction.
@@ -223,6 +225,7 @@ func (d *realSessionDB) ClaimOpenTransaction(connID ConnectionID) error {
 		return ErrOnlyOneTransactionAtATime
 	}
 	d.connectionWithOpenTx = connID
+	d.inUserTx.Store(true)
 	return nil
 }
 
@@ -238,6 +241,7 @@ func (d *realSessionDB) ReleaseOpenTransaction(connID ConnectionID) {
 func (d *realSessionDB) releaseOpenTransactionLocked(connID ConnectionID) {
 	if d.connectionWithOpenTx == connID {
 		d.connectionWithOpenTx = 0
+		d.inUserTx.Store(false)
 	}
 }
 

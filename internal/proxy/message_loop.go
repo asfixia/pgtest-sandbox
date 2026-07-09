@@ -169,7 +169,9 @@ func (p *proxyConnection) runDisconnectCleanup(testID string) {
 	p.releaseOpenTransactionOnDisconnect(testID)
 	if !p.destroySessionIfRequested(testID) {
 		log.Printf("[PROXY] disconnect cleanup done (testID=%s, conn=%s)", testID, remoteAddr)
+		return
 	}
+	p.server.PgRollback.PublishSnapshot()
 }
 
 // RunMessageLoop é o loop principal que processa as mensagens do cliente.
@@ -361,6 +363,7 @@ func (p *proxyConnection) handleMessageExecute(testID string, msg *pgproto3.Exec
 			connLabel = p.clientConn.RemoteAddr().String()
 		}
 		session.DB.SetLastQueryWithParams(query, args, connLabel)
+		p.server.PgRollback.PublishSessionUpdate(testID)
 	}
 	if p.IsMultiStatement(stmtName) {
 		// Run as batch and send only the last result (same behavior as Simple Query multi-statement).
@@ -394,6 +397,7 @@ func (p *proxyConnection) handleMessageExecute(testID string, msg *pgproto3.Exec
 	elapsed := time.Since(start)
 	session.DB.UnlockRun()
 	session.DB.Gui.UpdateLastQueryHistoryDuration(elapsed)
+	p.server.PgRollback.PublishSessionUpdate(testID)
 	if err != nil {
 		log.Printf("[PROXY] ExecPrepared failed: %v", err)
 		p.sendExtendedQueryErr(err)
@@ -505,15 +509,12 @@ func (p *proxyConnection) handleMessageQuery(testID string, msg *pgproto3.Query)
 	//p.lastQuery = "" // Limpa a query armazenada para evitar execução duplicada
 	//p.inExtendedQuery = false
 	//p.mu.Unlock()
-	start := time.Now()
+	// Query history Running/Duration is finalized inside ForwardCommandToDB/ExecuteSelectQuery/
+	// SafeForwardMultipleCommandsToDB (via defer, on every exit path); nothing to finalize here.
 	if err := p.ProcessSimpleQuery(testID, queryStr); err != nil {
 		log.Printf("[PROXY] Erro ao processar Query Simples: %v", err)
 		p.SendErrorResponse(err)
 	} else {
-		elapsed := time.Since(start)
-		if session := p.server.PgRollback.GetSession(testID); session != nil && session.DB != nil {
-			session.DB.Gui.UpdateLastQueryHistoryDuration(elapsed)
-		}
 		log.Printf("[PROXY] Query Simples processada com sucesso: %s", queryStr)
 	}
 	p.backend.Flush()

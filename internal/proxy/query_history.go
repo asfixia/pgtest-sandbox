@@ -14,6 +14,7 @@ type QueryHistoryEntry struct {
 	Query    string
 	At       time.Time
 	Duration string // execution time e.g. "12.345ms"; set when query completes
+	Running  bool   // true from the moment the query is logged until UpdateLastQueryHistoryDuration runs (success or error)
 }
 
 // isInternalNoiseQuery returns true for standard driver/internal queries we don't want in the GUI history.
@@ -31,15 +32,16 @@ func isInternalNoiseQuery(query string) bool {
 	return sqlpkg.IsDeallocateNoise(stmts[0].Stmt)
 }
 
-// SetLastQuery appends the query to the session's query history (max maxQueryHistory).
-// Internal noise queries (e.g. DEALLOCATE from the driver) are not recorded.
+// SetLastQuery appends the query to the session's query history (max maxQueryHistory), marked
+// Running until UpdateLastQueryHistoryDuration runs. Internal noise queries (e.g. DEALLOCATE
+// from the driver) are not recorded.
 func (g *guiState) SetLastQuery(query string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if isInternalNoiseQuery(query) {
 		return
 	}
-	g.queryHistory = append(g.queryHistory, QueryHistoryEntry{Query: query, At: time.Now(), Duration: ""})
+	g.queryHistory = append(g.queryHistory, QueryHistoryEntry{Query: query, At: time.Now(), Duration: "", Running: true})
 	if len(g.queryHistory) > maxQueryHistory {
 		g.queryHistory = g.queryHistory[1:]
 	}
@@ -78,18 +80,22 @@ func (g *guiState) GetLastQueryDuration() string {
 	return g.queryHistory[len(g.queryHistory)-1].Duration
 }
 
-// UpdateLastQueryHistoryDuration sets the duration of the most recently appended query (call after execution completes).
+// UpdateLastQueryHistoryDuration sets the duration of the most recently appended query and
+// clears Running. Call exactly once after the query finishes, on every exit path (success or
+// error) — callers use defer for this so a failed query never gets stuck showing as Running.
 func (g *guiState) UpdateLastQueryHistoryDuration(elapsed time.Duration) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if len(g.queryHistory) == 0 {
 		return
 	}
+	last := &g.queryHistory[len(g.queryHistory)-1]
+	last.Running = false
 	if elapsed == 0 {
-		g.queryHistory[len(g.queryHistory)-1].Duration = ""
+		last.Duration = ""
 		return
 	}
-	g.queryHistory[len(g.queryHistory)-1].Duration = elapsed.String()
+	last.Duration = elapsed.String()
 }
 
 // ClearLastQuery removes the last query from history so GetLastQuery() returns "" or the previous query.

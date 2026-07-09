@@ -200,7 +200,14 @@ func (p *proxyConnection) ForwardCommandToDB(testID string, query string, sendRe
 
 	log.Printf("[PROXY] ForwardCommandToDB: Executando via transação: %s", query)
 	session.DB.Gui.SetLastQuery(query)
+	p.server.PgRollback.PublishSessionUpdate(testID)
 	start := time.Now()
+	// Finalize on every exit path (success or error) so a failed query is never left showing
+	// as Running in the GUI history.
+	defer func() {
+		session.DB.Gui.UpdateLastQueryHistoryDuration(time.Since(start))
+		p.server.PgRollback.PublishSessionUpdate(testID)
+	}()
 
 	// All TCL (SAVEPOINT, RELEASE, ROLLBACK) goes to SafeExecTCL, which runs inside a guard
 	// so failed TCL does not abort the main transaction; it skips guard Commit on success
@@ -277,10 +284,6 @@ func (p *proxyConnection) ForwardCommandToDB(testID string, query string, sendRe
 		p.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte("-- ping")})
 	}
 
-	elapsed := time.Since(start)
-	if session.DB != nil {
-		session.DB.Gui.UpdateLastQueryHistoryDuration(elapsed)
-	}
 	if sendReadyForQuery {
 		if os.Getenv("PGROLLBACK_LOG_MESSAGE_ORDER") == "1" {
 			log.Printf("[MSG_ORDER] SEND ReadyForQuery")
@@ -295,6 +298,8 @@ func (p *proxyConnection) ForwardCommandToDB(testID string, query string, sendRe
 
 // safeForwardMultipleCommandsSequential runs each statement through ForwardCommandToDB so InterceptQuery
 // rewrites COMMIT/BEGIN/ROLLBACK. LockRun cannot be held across ForwardCommandToDB (SafeExec also locks d.mu).
+// The batch-level history entry (and its Running flag) is finalized by the caller, SafeForwardMultipleCommandsToDB,
+// via defer, on every exit path of this function.
 func (p *proxyConnection) safeForwardMultipleCommandsSequential(
 	testID string,
 	commands []string,
@@ -302,7 +307,6 @@ func (p *proxyConnection) safeForwardMultipleCommandsSequential(
 	ctx context.Context,
 	session *TestSession,
 	multiCommandSavepointName string,
-	start time.Time,
 ) error {
 	session.DB.LockRun()
 	if session.DB == nil {
@@ -347,8 +351,6 @@ func (p *proxyConnection) safeForwardMultipleCommandsSequential(
 	if err := p.backend.Flush(); err != nil {
 		return fmt.Errorf("falha no flush de múltiplos resultados: %w", err)
 	}
-	elapsed := time.Since(start)
-	session.DB.Gui.UpdateLastQueryHistoryDuration(elapsed)
 	log.Printf("[PROXY] Multi-command batch executed")
 	if sendReadyForQuery {
 		p.SendReadyForQuery()
@@ -380,10 +382,17 @@ func (p *proxyConnection) SafeForwardMultipleCommandsToDB(testID string, command
 	// Gui methods are self-contained, safe to call before LockRun.
 	fullQuery := strings.Join(commands, "; ")
 	session.DB.Gui.SetLastQuery(fullQuery)
+	p.server.PgRollback.PublishSessionUpdate(testID)
 	if !strings.HasSuffix(fullQuery, ";") {
 		fullQuery += ";"
 	}
 	start := time.Now()
+	// Finalize the batch-level history entry on every exit path (success or error, sequential or
+	// batched) so a failed batch is never left showing as Running in the GUI history.
+	defer func() {
+		session.DB.Gui.UpdateLastQueryHistoryDuration(time.Since(start))
+		p.server.PgRollback.PublishSessionUpdate(testID)
+	}()
 
 	// Same as sequential ForwardCommandToDB: claim session before user SAVEPOINT (from BEGIN) runs.
 	for _, cmd := range commands {
@@ -405,7 +414,7 @@ func (p *proxyConnection) SafeForwardMultipleCommandsToDB(testID string, command
 		strings.Contains(strings.ToUpper(strings.TrimSpace(commands[1])), "RELEASE SAVEPOINT ")
 
 	if multiCommandBatchNeedsSequentialExec(commands) && !isRollbackPair {
-		return p.safeForwardMultipleCommandsSequential(testID, commands, sendReadyForQuery, ctx, session, multiCommandSavepointName, start)
+		return p.safeForwardMultipleCommandsSequential(testID, commands, sendReadyForQuery, ctx, session, multiCommandSavepointName)
 	}
 
 	session.DB.LockRun()
@@ -514,8 +523,6 @@ func (p *proxyConnection) SafeForwardMultipleCommandsToDB(testID string, command
 		return fmt.Errorf("falha no flush de múltiplos resultados: %w", err)
 	}
 
-	elapsed := time.Since(start)
-	session.DB.Gui.UpdateLastQueryHistoryDuration(elapsed)
 	log.Printf("[PROXY] Multi-command batch executed")
 	if sendReadyForQuery {
 		p.SendReadyForQuery()
@@ -529,11 +536,18 @@ func (p *proxyConnection) ExecuteSelectQuery(testID string, query string, sendRe
 	if session == nil {
 		return fmt.Errorf("sessão não encontrada para testID: %s", testID)
 	}
+	start := time.Now()
 	if session.DB != nil && query != "" {
 		session.DB.Gui.SetLastQuery(query)
+		p.server.PgRollback.PublishSessionUpdate(testID)
+		// Finalize on every exit path (success or error) so a failed query is never left
+		// showing as Running in the GUI history.
+		defer func() {
+			session.DB.Gui.UpdateLastQueryHistoryDuration(time.Since(start))
+			p.server.PgRollback.PublishSessionUpdate(testID)
+		}()
 	}
 
-	start := time.Now()
 	rows, err := session.DB.SafeQuery(session.Context(), query, args...)
 	if err != nil {
 		return err
@@ -544,10 +558,6 @@ func (p *proxyConnection) ExecuteSelectQuery(testID string, query string, sendRe
 		return err
 	}
 
-	elapsed := time.Since(start)
-	if session.DB != nil {
-		session.DB.Gui.UpdateLastQueryHistoryDuration(elapsed)
-	}
 	log.Printf("[PROXY] Query executed")
 	if sendReadyForQuery {
 		p.SendReadyForQuery()

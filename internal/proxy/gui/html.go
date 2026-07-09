@@ -161,6 +161,7 @@ const htmlTemplate = `<!DOCTYPE html>
       padding-right: 0.5rem;
     }
     .query-duration { color: #64748b; font-weight: 500; margin-left: 0.25rem; }
+    .query-duration.running { color: #f59e0b; }
     .actions { white-space: nowrap; }
     .history-btn, .close-btn, .clear-log-btn {
       padding: 0.35rem 0.75rem;
@@ -472,6 +473,34 @@ const htmlTemplate = `<!DOCTYPE html>
       var re = /\b(SELECT|FROM|WHERE|AND|OR|LEFT JOIN|RIGHT JOIN|INNER JOIN|JOIN|ON|GROUP BY|ORDER BY|LIMIT|OFFSET|INSERT INTO|UPDATE|SET|VALUES|RETURNING|DELETE FROM|CREATE |ALTER |DROP |BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE SAVEPOINT|WITH|UNION|HAVING)\b/gi;
       return s.replace(re, function(m) { return '\n' + m; }).replace(/\n+/g, '\n').trim();
     }
+    // Formats how long a still-running query has been running, e.g. "running 3s" / "running 1m 5s".
+    function formatElapsedMs(ms) {
+      if (!isFinite(ms) || ms < 1000) return 'running…';
+      var totalSec = Math.floor(ms / 1000);
+      var m = Math.floor(totalSec / 60);
+      var s = totalSec % 60;
+      return 'running ' + (m > 0 ? (m + 'm ' + s + 's') : (s + 's'));
+    }
+    // Returns the "(12.345ms)" / "(running...)" badge for a query. While running, the span carries
+    // data-started-at (ms epoch) so tickRunningIndicators() can update the live elapsed time without
+    // a full re-render (the row otherwise only updates on the next start/finish push event).
+    function durationOrRunningHtml(running, startedAtRaw, durationRaw) {
+      if (running) {
+        var ts = startedAtRaw ? (new Date(startedAtRaw)).getTime() : NaN;
+        var attr = (ts && !isNaN(ts)) ? (' data-started-at="' + ts + '"') : '';
+        return ' <span class="query-duration running"' + attr + '>(running…)</span>';
+      }
+      var d = formatDuration(durationRaw);
+      return (d && d.trim()) ? (' <span class="query-duration">(' + escapeHtml(d) + ')</span>') : '';
+    }
+    function tickRunningIndicators() {
+      var now = Date.now();
+      document.querySelectorAll('.query-duration.running[data-started-at]').forEach(function(el) {
+        var startedAt = parseInt(el.getAttribute('data-started-at'), 10);
+        if (!startedAt || isNaN(startedAt)) return;
+        el.textContent = '(' + formatElapsedMs(now - startedAt) + ')';
+      });
+    }
     function historyItemHtml(item) {
       var query = '';
       var at = '';
@@ -479,8 +508,7 @@ const htmlTemplate = `<!DOCTYPE html>
       if (item && typeof item === 'object' && item.query !== undefined) {
         query = item.query || '';
         at = item.at ? '<span class="qtime">' + escapeHtml(formatHistoryAt(item.at)) + '</span>' : '';
-        var d = formatDuration(item.duration);
-        dur = (d && d.trim()) ? ' <span class="query-duration">(' + escapeHtml(d) + ')</span>' : '';
+        dur = durationOrRunningHtml(item.running === true, item.at, item.duration);
       } else {
         query = typeof item === 'string' ? item : '';
       }
@@ -500,9 +528,9 @@ const htmlTemplate = `<!DOCTYPE html>
       sessions.forEach(function(s) {
         var q = escapeHtml(s.last_query || '');
         var qTitle = (s.last_query || '');
-        var d = formatDuration(s.last_query_duration);
-        var dur = (d && d.trim()) ? (' <span class="query-duration">(' + escapeHtml(d) + ')</span>') : '';
         var hist = s.query_history || [];
+        var lastHist = hist.length ? hist[hist.length - 1] : null;
+        var dur = durationOrRunningHtml(s.running === true, lastHist ? lastHist.at : null, s.last_query_duration);
         var n = hist.length;
         var txLabel = (s.in_transaction === true) ? 'Yes' : 'No';
         var txClass = (s.in_transaction === true) ? 'tx-status yes' : 'tx-status no';
@@ -567,8 +595,9 @@ const htmlTemplate = `<!DOCTYPE html>
       var mainRow = tbody.querySelector(sel);
       if (!mainRow) return;
       var q = s.last_query || '';
-      var dur = (s.last_query_duration && s.last_query_duration.trim()) ? (' <span class="query-duration">(' + escapeHtml(s.last_query_duration) + ')</span>') : '';
       var hist = s.query_history || [];
+      var lastHist = hist.length ? hist[hist.length - 1] : null;
+      var dur = durationOrRunningHtml(s.running === true, lastHist ? lastHist.at : null, s.last_query_duration);
       var n = hist.length;
       mainRow.cells[0].textContent = s.test_id;
       var txLabel = (s.in_transaction === true) ? 'Yes' : 'No';
@@ -641,9 +670,50 @@ const htmlTemplate = `<!DOCTYPE html>
       lastRenderedSessions = JSON.parse(JSON.stringify(sessions));
       if (settingsModalOpen && settingsModal) settingsModal.classList.add('visible');
     }
-    // Polling: we only ever replace tbody contents. Preserve UI state (settings modal open, history rows open, scroll) in render() so updates don't close modals or collapse panels.
+    // Applies a single-session push update (query started/finished) without touching the rest
+    // of the table. Falls back to a full resync if the row isn't present yet (e.g. a
+    // session_update raced ahead of the snapshot that introduces its row).
+    function handleSessionUpdate(s) {
+      if (!s || !s.test_id) return;
+      var exists = tbody.querySelector('tr.session-row[data-id="' + selectorEscape(s.test_id) + '"]');
+      if (!exists) { load(); return; }
+      updateRow(s.test_id, s);
+      if (lastRenderedSessions) {
+        var found = false;
+        for (var i = 0; i < lastRenderedSessions.length; i++) {
+          if (lastRenderedSessions[i].test_id === s.test_id) {
+            lastRenderedSessions[i] = JSON.parse(JSON.stringify(s));
+            found = true;
+            break;
+          }
+        }
+        if (!found) lastRenderedSessions.push(JSON.parse(JSON.stringify(s)));
+      }
+    }
+    // One-shot fetch of the full session list. Used for the Refresh button, the periodic
+    // safety-net resync, and as a fallback if the event stream hasn't connected yet.
     function load() {
       fetch('__API_BASE__/sessions').then(function(r) { return r.json(); }).then(render).catch(function(e) { tbody.innerHTML = '<tr><td colspan="4" class="empty">Error: ' + escapeHtml(e.message) + '</td></tr>'; });
+    }
+    // Live updates: the server pushes events over SSE instead of us polling on a timer, so the
+    // table updates the moment a query starts/finishes instead of waiting up to 1s for the next
+    // poll (and instead of that poll blocking behind a slow query). EventSource reconnects
+    // automatically; on (re)connect the server always sends a fresh "snapshot" first.
+    var sseGotData = false;
+    function connectEventStream() {
+      var es = new EventSource('__API_BASE__/sessions/stream');
+      es.addEventListener('snapshot', function(ev) {
+        sseGotData = true;
+        try { render(JSON.parse(ev.data).sessions || []); } catch (e) {}
+      });
+      es.addEventListener('session_update', function(ev) {
+        sseGotData = true;
+        try { handleSessionUpdate(JSON.parse(ev.data).session); } catch (e) {}
+      });
+      es.onerror = function() {
+        if (!sseGotData) load();
+      };
+      return es;
     }
     refreshBtn.addEventListener('click', load);
     var rollbackAllBtn = document.getElementById('rollbackAllBtn');
@@ -666,8 +736,15 @@ const htmlTemplate = `<!DOCTYPE html>
       });
     }
     refreshBackendConnLine();
-    load();
-    setInterval(load, 1000);
+    connectEventStream();
+    // Safety-net resync in case a push event was ever dropped (Hub.Publish does not block or
+    // queue for a slow/disconnected subscriber); cheap now that GetSessions never blocks behind
+    // a running query.
+    setInterval(load, 30000);
+    // Ticks the "(running Xs)" badges so a long/stale query's elapsed time updates live even
+    // when no new push event arrives (start/finish are the only events; nothing fires while a
+    // query is just sitting there running).
+    setInterval(tickRunningIndicators, 1000);
 
     if (settingsBtn && settingsModal) {
       settingsBtn.addEventListener('click', function() {
