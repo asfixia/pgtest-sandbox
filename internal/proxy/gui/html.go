@@ -231,8 +231,11 @@ const htmlTemplate = `<!DOCTYPE html>
       padding-right: 0.25rem;
     }
     .history-list ul {
-      display: flex;
-      flex-direction: column-reverse;
+      /* Newest-first is achieved by building <li> elements in reverse in the script (search for
+         "Newest first" below), not flex-direction: column-reverse — that trick reverses paint
+         order but not DOM/selection order, which makes click-drag text selection jump around
+         unpredictably. */
+      display: block;
     }
     .history-list.full-height { max-height: none; }
     .history-list::-webkit-scrollbar { width: 8px; }
@@ -567,6 +570,7 @@ const htmlTemplate = `<!DOCTYPE html>
       }
       return '<span class="lock-status blocked' + extraClass + '" title="' + escapeHtml(title) + '"><span class="lock-badge">' + escapeHtml(label) + '</span></span>';
     }
+    function sessionKeys(sessions) {
       var ids = [];
       for (var i = 0; i < sessions.length; i++) ids.push(sessions[i].test_id);
       ids.sort();
@@ -585,7 +589,8 @@ const htmlTemplate = `<!DOCTYPE html>
         var txClass = (s.in_transaction === true) ? 'tx-status yes' : 'tx-status no';
         html += '<tr class="session-row" data-id="' + escapeHtml(s.test_id) + '"><td>' + escapeHtml(s.test_id) + '</td><td class="' + txClass + '">' + txLabel + '</td><td>' + lockStatusHtml(s) + '</td><td class="query" title="' + escapeHtml(qTitle) + '">' + q + dur + '</td><td><button type="button" class="history-btn" data-id="' + escapeHtml(s.test_id) + '">History (' + n + ')</button><button type="button" class="clear-log-btn" data-id="' + escapeHtml(s.test_id) + '">Clear log</button><button type="button" class="close-btn" data-id="' + escapeHtml(s.test_id) + '">Disconnect</button></td></tr>';
         html += '<tr class="history-row" data-id="' + escapeHtml(s.test_id) + '" style="display:none"><td colspan="5"><div class="history-list-wrap"><div class="history-list-toolbar"><button type="button" class="history-height-btn">Full height</button></div><div class="history-list"><ul>';
-        for (var j = 0; j < hist.length; j++) {
+        // Newest first, in actual DOM order (not via CSS column-reverse - see .history-list ul).
+        for (var j = hist.length - 1; j >= 0; j--) {
           html += '<li>' + historyItemHtml(hist[j]) + '</li>';
         }
         html += '</ul></div></div></td></tr>';
@@ -661,27 +666,37 @@ const htmlTemplate = `<!DOCTYPE html>
       if (histBtn) histBtn.textContent = 'History (' + n + ')';
       var historyRow = tbody.querySelector('tr.history-row[data-id="' + selectorEscape(id) + '"]');
       if (!historyRow) return;
-      var ul = historyRow.querySelector('.history-list ul');
+      var listWrap = historyRow.querySelector('.history-list');
+      var ul = listWrap ? listWrap.querySelector('ul') : null;
       if (!ul) return;
-      var prevLen = lastRenderedSessions ? (function() {
+      var prevHist = lastRenderedSessions ? (function() {
         for (var i = 0; i < lastRenderedSessions.length; i++)
-          if (lastRenderedSessions[i].test_id === id) return (lastRenderedSessions[i].query_history || []).length;
-        return 0;
-      }()) : 0;
-      if (hist.length > prevLen) {
-        for (var j = prevLen; j < hist.length; j++) {
-          var li = document.createElement('li');
-          li.innerHTML = historyItemHtml(hist[j]);
-          ul.appendChild(li);
-        }
-      } else if (hist.length < prevLen || ul.children.length !== hist.length) {
+          if (lastRenderedSessions[i].test_id === id) return lastRenderedSessions[i].query_history || [];
+        return [];
+      }()) : [];
+      // Compare full contents, not just length: server history is a capped FIFO window (oldest
+      // dropped once maxQueryHistory is hit), so length alone stops changing once the cap is
+      // reached and a length-only diff would silently stop appending new queries forever. This
+      // also catches a query's Running -> finished transition, which changes the last entry's
+      // duration/running fields without changing the count.
+      if (!historyListMatches(prevHist, hist)) {
+        var scrollTop = listWrap.scrollTop;
         ul.innerHTML = '';
-        for (var j = 0; j < hist.length; j++) {
+        // Newest first, in actual DOM order (not via CSS column-reverse - see .history-list ul).
+        for (var j = hist.length - 1; j >= 0; j--) {
           var li = document.createElement('li');
           li.innerHTML = historyItemHtml(hist[j]);
           ul.appendChild(li);
         }
+        listWrap.scrollTop = scrollTop;
       }
+    }
+    function historyListMatches(a, b) {
+      if (a.length !== b.length) return false;
+      for (var i = 0; i < a.length; i++) {
+        if (a[i].query !== b[i].query || a[i].at !== b[i].at || a[i].duration !== b[i].duration || a[i].running !== b[i].running) return false;
+      }
+      return true;
     }
     // Preserve UI state across polling updates so modal/history don't close unexpectedly.
     function render(sessions) {

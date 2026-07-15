@@ -135,6 +135,12 @@ type PgRollback struct {
 
 	lockInspector     *lockInspector
 	lockInspectorOnce sync.Once
+
+	// lockPoller refreshes cached LockStatus in the background (lock_status_poller.go), off the
+	// query-execution and session-creation paths.
+	lockPollerOnce     sync.Once
+	lockPollerStop     chan struct{}
+	lockPollerStopOnce sync.Once
 }
 
 // GetLastQueryDuration returns the last query execution duration (e.g. "12.345ms") for GUI, derived from the last history entry.
@@ -239,7 +245,7 @@ func (s *TestSession) unregisterProxyClient(c net.Conn) {
 }
 
 func NewPgRollback(postgresHost string, postgresPort int, postgresDB, postgresUser, postgresPass string, timeout time.Duration, sessionTimeout time.Duration, keepaliveInterval time.Duration) *PgRollback {
-	return &PgRollback{
+	p := &PgRollback{
 		SessionsByTestID:  make(map[string]*TestSession),
 		PostgresHost:      postgresHost,
 		PostgresPort:      postgresPort,
@@ -251,11 +257,16 @@ func NewPgRollback(postgresHost string, postgresPort int, postgresDB, postgresUs
 		KeepaliveInterval: keepaliveInterval,
 		Events:            gui.NewHub(),
 	}
+	p.startLockStatusPoller()
+	return p
 }
 
 // SessionInfoFor builds the GUI snapshot for one session (same shape as GetSessions' per-session
-// entry). Returns false if the session does not exist. Safe to call while a query is running on
-// that session (no field read here takes the query-execution lock).
+// entry), including a live pg_locks/pg_stat_activity lookup. Returns false if the session does
+// not exist. Safe to call while a query is running on that session (no field read here takes the
+// query-execution lock), but it does a synchronous Postgres round trip — do not call this from
+// the query-execution hot path or session creation (use sessionInfoWithoutLockStatus there, which
+// reads the cache lock_status_poller.go keeps warm instead).
 func (p *PgRollback) SessionInfoFor(testID string) (gui.SessionInfo, bool) {
 	info, ok := p.sessionInfoWithoutLockStatus(testID)
 	if !ok {
@@ -265,8 +276,12 @@ func (p *PgRollback) SessionInfoFor(testID string) (gui.SessionInfo, bool) {
 	return info, true
 }
 
-// sessionInfoWithoutLockStatus builds SessionInfo without querying pg_locks (used by GetSessions
-// to batch lock lookups in one inspector round-trip).
+// sessionInfoWithoutLockStatus builds SessionInfo entirely from in-memory state: no live
+// pg_locks/pg_stat_activity query. LockStatus comes from the cache lock_status_poller.go keeps
+// warm (may lag reality by up to one poll interval). Used by the query-execution hot path
+// (PublishSessionUpdate) and session creation (PublishSnapshot), which must never block on
+// Postgres just to log a query or admit a new connection; GetSessions() overlays a fresh batched
+// live lookup on top via enrichSessionsLockStatus for its own response.
 func (p *PgRollback) sessionInfoWithoutLockStatus(testID string) (gui.SessionInfo, bool) {
 	session := p.GetSession(testID)
 	if session == nil {
@@ -276,6 +291,7 @@ func (p *PgRollback) sessionInfoWithoutLockStatus(testID string) (gui.SessionInf
 	lastQuery := ""
 	running := false
 	var queryHistory []gui.QueryHistoryItem
+	var lockStatus *gui.LockStatus
 	lastQueryDuration := session.GetLastQueryDuration()
 	if session.DB != nil {
 		inTransaction = session.DB.HasOpenUserTransaction()
@@ -288,10 +304,12 @@ func (p *PgRollback) sessionInfoWithoutLockStatus(testID string) (gui.SessionInf
 		if n := len(queryHistory); n > 0 {
 			running = queryHistory[n-1].Running
 		}
+		lockStatus = session.DB.Gui.CachedLockStatus()
 	}
 	return gui.SessionInfo{
 		TestID:            testID,
 		InTransaction:     inTransaction,
+		LockStatus:        lockStatus,
 		LastQuery:         lastQuery,
 		LastQueryDuration: lastQueryDuration,
 		Running:           running,
@@ -301,11 +319,14 @@ func (p *PgRollback) sessionInfoWithoutLockStatus(testID string) (gui.SessionInf
 
 // PublishSessionUpdate emits an EventSessionUpdate for testID (e.g. query started/finished,
 // history cleared). No-op if the session no longer exists or Events is unset (e.g. in tests).
+// Deliberately in-memory only (sessionInfoWithoutLockStatus, not SessionInfoFor): this runs
+// synchronously inline in the query-execution path for every query, so it must never do a
+// Postgres round trip.
 func (p *PgRollback) PublishSessionUpdate(testID string) {
 	if p.Events == nil {
 		return
 	}
-	info, ok := p.SessionInfoFor(testID)
+	info, ok := p.sessionInfoWithoutLockStatus(testID)
 	if !ok {
 		return
 	}
@@ -313,7 +334,8 @@ func (p *PgRollback) PublishSessionUpdate(testID string) {
 }
 
 // PublishSnapshot emits an EventSnapshot with the full current session list (e.g. session
-// created/destroyed). No-op if Events is unset (e.g. in tests).
+// created/destroyed). No-op if Events is unset (e.g. in tests). In-memory only, same reasoning as
+// PublishSessionUpdate: GetOrCreateSession calls this synchronously while admitting a new client.
 func (p *PgRollback) PublishSnapshot() {
 	if p.Events == nil {
 		return
@@ -321,7 +343,7 @@ func (p *PgRollback) PublishSnapshot() {
 	sessions := p.GetAllSessions()
 	list := make([]gui.SessionInfo, 0, len(sessions))
 	for testID := range sessions {
-		if info, ok := p.SessionInfoFor(testID); ok {
+		if info, ok := p.sessionInfoWithoutLockStatus(testID); ok {
 			list = append(list, info)
 		}
 	}

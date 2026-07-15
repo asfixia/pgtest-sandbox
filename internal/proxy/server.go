@@ -229,6 +229,7 @@ func (s *Server) acceptConnections() {
 }
 
 func (s *Server) Stop() error {
+	s.PgRollback.StopLockStatusPoller()
 	s.mu.Lock()
 	if s.listener != nil {
 		listener := s.listener

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"pgrollback/internal/proxy/gui"
 	sqlpkg "pgrollback/pkg/sql"
 )
 
@@ -31,6 +32,12 @@ type guiState struct {
 	mu           sync.RWMutex
 	queryHistory []QueryHistoryEntry
 	running      int
+	// lockStatus is the most recently known result of a live pg_locks/pg_stat_activity lookup,
+	// written by the background poller (lock_status_poller.go) or an on-demand GetSessions() call.
+	// Query-hot-path reads (PublishSessionUpdate/PublishSnapshot) use this instead of querying
+	// Postgres themselves, so logging a query never blocks the query itself. May lag reality by
+	// up to one poll interval; nil means "not waiting on a lock" (or not yet computed).
+	lockStatus *gui.LockStatus
 }
 
 // realSessionDB encapsulates the PostgreSQL connection and its active transaction.

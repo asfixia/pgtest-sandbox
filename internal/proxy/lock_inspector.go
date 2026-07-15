@@ -71,18 +71,24 @@ func (p *PgRollback) ensureLockInspector() *lockInspector {
 	return p.lockInspector
 }
 
-// enrichLockStatusForSession fills LockStatus on one SessionInfo (no-op when inspector unavailable).
+// enrichLockStatusForSession fills LockStatus on one SessionInfo with a live lookup (no-op when
+// inspector unavailable) and warms the session's cache so later hot-path reads see the result.
 func (p *PgRollback) enrichLockStatusForSession(info *gui.SessionInfo) {
 	if info == nil {
 		return
 	}
-	statuses := p.ensureLockInspector().lookup(context.Background(), []string{getAppNameForTestID(info.TestID)})
-	if st, ok := statuses[getAppNameForTestID(info.TestID)]; ok {
-		info.LockStatus = &st
+	appName := getAppNameForTestID(info.TestID)
+	statuses := p.ensureLockInspector().lookup(context.Background(), []string{appName})
+	var result *gui.LockStatus
+	if st, ok := statuses[appName]; ok {
+		result = &st
 	}
+	info.LockStatus = result
+	p.cacheLockStatus(info.TestID, result)
 }
 
-// enrichSessionsLockStatus batch-fills LockStatus for GUI session lists.
+// enrichSessionsLockStatus batch-fills LockStatus for GUI session lists with one live lookup
+// round trip, and warms each session's cache so later hot-path reads see the result.
 func (p *PgRollback) enrichSessionsLockStatus(list []gui.SessionInfo) {
 	if len(list) == 0 {
 		return
@@ -93,10 +99,23 @@ func (p *PgRollback) enrichSessionsLockStatus(list []gui.SessionInfo) {
 	}
 	statuses := p.ensureLockInspector().lookup(context.Background(), appNames)
 	for i := range list {
+		var result *gui.LockStatus
 		if st, ok := statuses[appNames[i]]; ok {
-			list[i].LockStatus = &st
+			result = &st
 		}
+		list[i].LockStatus = result
+		p.cacheLockStatus(list[i].TestID, result)
 	}
+}
+
+// cacheLockStatus stores the latest live lookup result on the session itself (no-op if the
+// session no longer exists), so PublishSessionUpdate/PublishSnapshot never need to query Postgres.
+func (p *PgRollback) cacheLockStatus(testID string, st *gui.LockStatus) {
+	session := p.GetSession(testID)
+	if session == nil || session.DB == nil {
+		return
+	}
+	session.DB.Gui.SetCachedLockStatus(st)
 }
 
 func (li *lockInspector) lookup(ctx context.Context, appNames []string) map[string]gui.LockStatus {
