@@ -199,15 +199,22 @@ func (p *proxyConnection) ForwardCommandToDB(testID string, query string, sendRe
 	var tag pgconn.CommandTag
 
 	log.Printf("[PROXY] ForwardCommandToDB: Executando via transação: %s", query)
-	session.DB.Gui.SetLastQuery(query)
+	logged := session.DB.Gui.SetLastQuery(query)
 	p.server.PgRollback.PublishSessionUpdate(testID)
 	start := time.Now()
+	var dbElapsed time.Duration
 	// Finalize on every exit path (success or error) so a failed query is never left showing
-	// as Running in the GUI history.
-	defer func() {
-		session.DB.Gui.UpdateLastQueryHistoryDuration(time.Since(start))
-		p.server.PgRollback.PublishSessionUpdate(testID)
-	}()
+	// as Running in the GUI history. dbElapsed is set below, right around the actual PostgreSQL
+	// call, so the GUI can show proxy overhead (total - dbElapsed) separately from real DB time.
+	// Skipped when SetLastQuery didn't append an entry (internal noise, e.g. DEALLOCATE from a
+	// driver's cleanup) - otherwise this would finalize whatever real query is currently last in
+	// this shared session's history instead of the noise query, corrupting its duration.
+	if logged {
+		defer func() {
+			session.DB.Gui.UpdateLastQueryHistoryDuration(time.Since(start), dbElapsed)
+			p.server.PgRollback.PublishSessionUpdate(testID)
+		}()
+	}
 
 	// All TCL (SAVEPOINT, RELEASE, ROLLBACK) goes to SafeExecTCL, which runs inside a guard
 	// so failed TCL does not abort the main transaction; it skips guard Commit on success
@@ -233,7 +240,9 @@ func (p *proxyConnection) ForwardCommandToDB(testID string, query string, sendRe
 				return err
 			}
 		}
+		dbStart := time.Now()
 		tag, err = session.DB.SafeExecTCL(session.Context(), query, args...)
+		dbElapsed = time.Since(dbStart)
 		if err != nil {
 			affectsClaim := isUserBegin
 			if stmt != nil {
@@ -253,7 +262,9 @@ func (p *proxyConnection) ForwardCommandToDB(testID string, query string, sendRe
 			return err
 		}
 	} else {
+		dbStart := time.Now()
 		tag, err = session.DB.SafeExec(session.Context(), query, args...)
+		dbElapsed = time.Since(dbStart)
 		if err != nil {
 			return err
 		}
@@ -381,18 +392,25 @@ func (p *proxyConnection) SafeForwardMultipleCommandsToDB(testID string, command
 
 	// Gui methods are self-contained, safe to call before LockRun.
 	fullQuery := strings.Join(commands, "; ")
-	session.DB.Gui.SetLastQuery(fullQuery)
+	logged := session.DB.Gui.SetLastQuery(fullQuery)
 	p.server.PgRollback.PublishSessionUpdate(testID)
 	if !strings.HasSuffix(fullQuery, ";") {
 		fullQuery += ";"
 	}
 	start := time.Now()
+	// dbElapsed stays 0 (untracked) when this batch is delegated to the sequential path below:
+	// each sub-command there is forwarded through ForwardCommandToDB, which logs and times itself
+	// as its own history entry, so the DB time is visible there instead of double-counted here.
+	var dbElapsed time.Duration
 	// Finalize the batch-level history entry on every exit path (success or error, sequential or
-	// batched) so a failed batch is never left showing as Running in the GUI history.
-	defer func() {
-		session.DB.Gui.UpdateLastQueryHistoryDuration(time.Since(start))
-		p.server.PgRollback.PublishSessionUpdate(testID)
-	}()
+	// batched) so a failed batch is never left showing as Running in the GUI history. Skipped when
+	// SetLastQuery didn't append an entry (see ForwardCommandToDB for why that matters).
+	if logged {
+		defer func() {
+			session.DB.Gui.UpdateLastQueryHistoryDuration(time.Since(start), dbElapsed)
+			p.server.PgRollback.PublishSessionUpdate(testID)
+		}()
+	}
 
 	// Same as sequential ForwardCommandToDB: claim session before user SAVEPOINT (from BEGIN) runs.
 	for _, cmd := range commands {
@@ -420,15 +438,28 @@ func (p *proxyConnection) SafeForwardMultipleCommandsToDB(testID string, command
 	session.DB.LockRun()
 	defer session.DB.UnlockRun()
 
+	// dbCall times one round trip to PostgreSQL and adds it to the batch's accumulated DB time.
+	dbCall := func(fn func() (pgconn.CommandTag, error)) (pgconn.CommandTag, error) {
+		t0 := time.Now()
+		tag, err := fn()
+		dbElapsed += time.Since(t0)
+		return tag, err
+	}
+
 	// Guard the whole batch with a savepoint: all run or none.
-	if _, err := session.DB.execTxLocked(ctx, "SAVEPOINT "+multiCommandSavepointName); err != nil {
+	if _, err := dbCall(func() (pgconn.CommandTag, error) {
+		return session.DB.execTxLocked(ctx, "SAVEPOINT "+multiCommandSavepointName)
+	}); err != nil {
 		return fmt.Errorf("criar savepoint para múltiplos comandos: %w", err)
 	}
 
 	rollbackSavepoint := func() {
-		_, _ = session.DB.execTxLocked(ctx, "ROLLBACK TO SAVEPOINT "+multiCommandSavepointName+"; RELEASE SAVEPOINT "+multiCommandSavepointName)
+		_, _ = dbCall(func() (pgconn.CommandTag, error) {
+			return session.DB.execTxLocked(ctx, "ROLLBACK TO SAVEPOINT "+multiCommandSavepointName+"; RELEASE SAVEPOINT "+multiCommandSavepointName)
+		})
 	}
 
+	dbStart := time.Now()
 	mrr := pgConn.Exec(ctx, fullQuery)
 	defer mrr.Close()
 
@@ -478,6 +509,7 @@ func (p *proxyConnection) SafeForwardMultipleCommandsToDB(testID string, command
 			lastResultTag = []byte(tag.String())
 		}
 	}
+	dbElapsed += time.Since(dbStart)
 
 	// Send only the last command's result.
 	if isRollbackPair {
@@ -492,17 +524,26 @@ func (p *proxyConnection) SafeForwardMultipleCommandsToDB(testID string, command
 		p.backend.Send(&pgproto3.CommandComplete{CommandTag: lastResultTag})
 	}
 
-	if err := mrr.Close(); err != nil {
+	mrrCloseStart := time.Now()
+	mrrCloseErr := mrr.Close()
+	dbElapsed += time.Since(mrrCloseStart)
+	if mrrCloseErr != nil {
 		rollbackSavepoint()
-		return fmt.Errorf("erro ao processar múltiplos resultados: %w", err)
+		return fmt.Errorf("erro ao processar múltiplos resultados: %w", mrrCloseErr)
 	}
 
 	// All commands succeeded; release savepoint so changes are kept.
-	_, secondGuardErr := session.DB.execTxLocked(ctx, "SAVEPOINT "+multiCommandSavepointName+"_inside")
+	_, secondGuardErr := dbCall(func() (pgconn.CommandTag, error) {
+		return session.DB.execTxLocked(ctx, "SAVEPOINT "+multiCommandSavepointName+"_inside")
+	})
 	if secondGuardErr == nil {
-		_, firstGuardErr := session.DB.execTxLocked(ctx, "RELEASE SAVEPOINT "+multiCommandSavepointName) //It can fail due to rollback before this point
+		_, firstGuardErr := dbCall(func() (pgconn.CommandTag, error) {
+			return session.DB.execTxLocked(ctx, "RELEASE SAVEPOINT "+multiCommandSavepointName) //It can fail due to rollback before this point
+		})
 		if firstGuardErr != nil {
-			_, errRollbackSecondGuard := session.DB.execTxLocked(ctx, "ROLLBACK TO SAVEPOINT "+multiCommandSavepointName+"_inside; RELEASE SAVEPOINT "+multiCommandSavepointName+"_inside")
+			_, errRollbackSecondGuard := dbCall(func() (pgconn.CommandTag, error) {
+				return session.DB.execTxLocked(ctx, "ROLLBACK TO SAVEPOINT "+multiCommandSavepointName+"_inside; RELEASE SAVEPOINT "+multiCommandSavepointName+"_inside")
+			})
 			if errRollbackSecondGuard != nil {
 				return fmt.Errorf("erro ao executar ROLLBACK TO SAVEPOINT e RELEASE SAVEPOINT: %w", errRollbackSecondGuard)
 			}
@@ -537,24 +578,35 @@ func (p *proxyConnection) ExecuteSelectQuery(testID string, query string, sendRe
 		return fmt.Errorf("sessão não encontrada para testID: %s", testID)
 	}
 	start := time.Now()
-	if session.DB != nil && query != "" {
-		session.DB.Gui.SetLastQuery(query)
+	var dbElapsed time.Duration
+	if session.DB != nil && query != "" && session.DB.Gui.SetLastQuery(query) {
 		p.server.PgRollback.PublishSessionUpdate(testID)
 		// Finalize on every exit path (success or error) so a failed query is never left
-		// showing as Running in the GUI history.
+		// showing as Running in the GUI history. dbElapsed accumulates below, across the
+		// SafeQuery call, row streaming, and rows.Close() (which commits the guard savepoint) -
+		// everything that is an actual PostgreSQL round trip rather than proxy-side work.
+		// Skipped when SetLastQuery didn't append an entry (see ForwardCommandToDB for why).
 		defer func() {
-			session.DB.Gui.UpdateLastQueryHistoryDuration(time.Since(start))
+			session.DB.Gui.UpdateLastQueryHistoryDuration(time.Since(start), dbElapsed)
 			p.server.PgRollback.PublishSessionUpdate(testID)
 		}()
 	}
 
+	dbStart := time.Now()
 	rows, err := session.DB.SafeQuery(session.Context(), query, args...)
+	dbElapsed += time.Since(dbStart)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
+	defer func() {
+		t0 := time.Now()
+		rows.Close()
+		dbElapsed += time.Since(t0)
+	}()
 
-	if err := p.SendSelectResultsWithQuery(rows, query); err != nil {
+	dbWait, err := p.SendSelectResultsWithQuery(rows, query)
+	dbElapsed += dbWait
+	if err != nil {
 		return err
 	}
 

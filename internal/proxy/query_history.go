@@ -13,8 +13,17 @@ const maxQueryHistory = 100
 type QueryHistoryEntry struct {
 	Query    string
 	At       time.Time
-	Duration string // execution time e.g. "12.345ms"; set when query completes
-	Running  bool   // true from the moment the query is logged until UpdateLastQueryHistoryDuration runs (success or error)
+	Duration string // total wall-clock time the proxy spent on this query, e.g. "12.345ms"; set when query completes
+	// DBDuration is the portion of Duration spent in the actual round trip(s) to the real
+	// PostgreSQL backend. Empty when not tracked for this query (e.g. a composite multi-statement
+	// batch whose sub-commands are logged as their own entries - see SafeForwardMultipleCommandsToDB).
+	DBDuration string
+	// ProxyDuration is Duration minus DBDuration: time the proxy itself spent on this query
+	// (interception, protocol handling, GUI logging) that isn't a PostgreSQL round trip. Computed
+	// once in UpdateLastQueryHistoryDuration so the GUI never has to parse/subtract duration
+	// strings itself. Empty whenever DBDuration is empty.
+	ProxyDuration string
+	Running       bool // true from the moment the query is logged until UpdateLastQueryHistoryDuration runs (success or error)
 }
 
 // isInternalNoiseQuery returns true for standard driver/internal queries we don't want in the GUI history.
@@ -34,28 +43,34 @@ func isInternalNoiseQuery(query string) bool {
 
 // SetLastQuery appends the query to the session's query history (max maxQueryHistory), marked
 // Running until UpdateLastQueryHistoryDuration runs. Internal noise queries (e.g. DEALLOCATE
-// from the driver) are not recorded.
-func (g *guiState) SetLastQuery(query string) {
+// from the driver) are not recorded. Returns whether an entry was appended: callers MUST skip
+// the matching UpdateLastQueryHistoryDuration call when this is false, since that call blindly
+// finalizes whatever is currently the last entry - if this query logged nothing (e.g. a
+// DEALLOCATE from one connection while another connection's real query is still the last entry
+// in this shared session's history), calling it anyway stomps that unrelated entry's duration.
+func (g *guiState) SetLastQuery(query string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if isInternalNoiseQuery(query) {
-		return
+		return false
 	}
 	g.queryHistory = append(g.queryHistory, QueryHistoryEntry{Query: query, At: time.Now(), Duration: "", Running: true})
 	if len(g.queryHistory) > maxQueryHistory {
 		g.queryHistory = g.queryHistory[1:]
 	}
+	return true
 }
 
 // SetLastQueryWithParams stores the query with $1, $2, ... substituted by the given args (for extended protocol).
 // connLabel is optional (e.g. connection remote address) and is prepended in the stored query for GUI.
-func (d *realSessionDB) SetLastQueryWithParams(query string, args []any, connLabel string) {
+// Returns whether an entry was appended (see SetLastQuery) - callers must use this to decide
+// whether to finalize a matching UpdateLastQueryHistoryDuration call.
+func (d *realSessionDB) SetLastQueryWithParams(query string, args []any, connLabel string) bool {
 	if len(args) == 0 {
-		d.Gui.SetLastQuery(query)
-		return
+		return d.Gui.SetLastQuery(query)
 	}
 	resolved := sqlpkg.SubstituteParams(query, args, connLabel)
-	d.Gui.SetLastQuery(resolved)
+	return d.Gui.SetLastQuery(resolved)
 }
 
 // GetQueryHistory returns a copy of the last executed queries with timestamps (oldest first), at most maxQueryHistory.
@@ -80,10 +95,15 @@ func (g *guiState) GetLastQueryDuration() string {
 	return g.queryHistory[len(g.queryHistory)-1].Duration
 }
 
-// UpdateLastQueryHistoryDuration sets the duration of the most recently appended query and
-// clears Running. Call exactly once after the query finishes, on every exit path (success or
-// error) — callers use defer for this so a failed query never gets stuck showing as Running.
-func (g *guiState) UpdateLastQueryHistoryDuration(elapsed time.Duration) {
+// UpdateLastQueryHistoryDuration sets the total and DB-only duration of the most recently
+// appended query and clears Running. Call exactly once after the query finishes, on every exit
+// path (success or error) — callers use defer for this so a failed query never gets stuck showing
+// as Running.
+//
+// dbElapsed is the portion of elapsed spent in the actual round trip(s) to PostgreSQL; pass 0 when
+// that isn't tracked for this call site (see DBDuration on QueryHistoryEntry), which leaves
+// DBDuration/ProxyDuration empty rather than reporting a misleading split.
+func (g *guiState) UpdateLastQueryHistoryDuration(elapsed, dbElapsed time.Duration) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if len(g.queryHistory) == 0 {
@@ -93,9 +113,16 @@ func (g *guiState) UpdateLastQueryHistoryDuration(elapsed time.Duration) {
 	last.Running = false
 	if elapsed == 0 {
 		last.Duration = ""
+	} else {
+		last.Duration = elapsed.String()
+	}
+	if dbElapsed <= 0 {
+		last.DBDuration = ""
+		last.ProxyDuration = ""
 		return
 	}
-	last.Duration = elapsed.String()
+	last.DBDuration = dbElapsed.String()
+	last.ProxyDuration = (elapsed - dbElapsed).String()
 }
 
 // ClearLastQuery removes the last query from history so GetLastQuery() returns "" or the previous query.

@@ -4,8 +4,14 @@ package gui
 type QueryHistoryItem struct {
 	Query    string `json:"query"`
 	At       string `json:"at"`       // RFC3339 or similar for display; also the query's start time while Running
-	Duration string `json:"duration"` // execution time e.g. "12.345ms"; empty while Running
-	Running  bool   `json:"running"`  // true from the moment the query is logged until it finishes (success or error)
+	Duration string `json:"duration"` // total time the proxy spent handling this query, e.g. "12.345ms"; empty while Running
+	// DBDuration is the portion of Duration spent in the actual round trip(s) to the real
+	// PostgreSQL backend; ProxyDuration is Duration minus DBDuration (proxy-side overhead: query
+	// interception, protocol handling, GUI logging). Both empty when not tracked for this entry
+	// (e.g. a composite multi-statement batch - see DBDuration on proxy.QueryHistoryEntry).
+	DBDuration    string `json:"db_duration,omitempty"`
+	ProxyDuration string `json:"proxy_duration,omitempty"`
+	Running       bool   `json:"running"` // true from the moment the query is logged until it finishes (success or error)
 }
 
 // LockStatus describes whether a session backend is waiting on a PostgreSQL lock and who blocks it.

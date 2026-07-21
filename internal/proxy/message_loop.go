@@ -117,21 +117,34 @@ func (p *proxyConnection) sendDescribeFromSD(sd *pgconn.StatementDescription, ob
 
 // executeViaExecPrepared calls PgConn.ExecPrepared for the given portal, reads all results,
 // and sends DataRow + CommandComplete to the client. Returns an error if the execution fails.
-func (p *proxyConnection) executeViaExecPrepared(ctx context.Context, pgConn *pgconn.PgConn, stmtName string, params [][]byte, paramFormats []int16, resultFormats []int16) error {
+//
+// Returns dbWait: time spent inside rr.NextRow()/rr.Close() (waiting on/reading from PostgreSQL),
+// separate from the backend.Send() calls in the same loop (proxy-side work), so the caller can
+// report accurate DB-vs-proxy-overhead timing even though both happen interleaved per row.
+func (p *proxyConnection) executeViaExecPrepared(ctx context.Context, pgConn *pgconn.PgConn, stmtName string, params [][]byte, paramFormats []int16, resultFormats []int16) (time.Duration, error) {
+	var dbWait time.Duration
 	rr := pgConn.ExecPrepared(ctx, stmtName, params, paramFormats, resultFormats)
 	// Read all rows and forward as DataRow messages.
-	for rr.NextRow() {
+	for {
+		t0 := time.Now()
+		hasNext := rr.NextRow()
+		dbWait += time.Since(t0)
+		if !hasNext {
+			break
+		}
 		values := rr.Values()
 		p.backend.Send(&pgproto3.DataRow{Values: values})
 	}
 	// Close finishes reading (CommandComplete + ReadyForQuery internally).
+	t0 := time.Now()
 	tag, err := rr.Close()
+	dbWait += time.Since(t0)
 	if err != nil {
-		return err
+		return dbWait, err
 	}
 	p.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(tag.String())})
 	p.backend.Flush()
-	return nil
+	return dbWait, nil
 }
 
 // runDisconnectCleanup runs rollback, release, and deallocate cleanup for this connection.
@@ -356,13 +369,14 @@ func (p *proxyConnection) handleMessageExecute(testID string, msg *pgproto3.Exec
 		p.sendExtendedQueryErr(fmt.Errorf("portal ou statement não encontrado para execução (portal=%q)", msg.Portal))
 		return
 	}
+	logged := false
 	if query != "" && session.DB != nil {
 		args := bindParamsToArgs(params, formatCodes)
 		connLabel := ""
 		if p.clientConn != nil {
 			connLabel = p.clientConn.RemoteAddr().String()
 		}
-		session.DB.SetLastQueryWithParams(query, args, connLabel)
+		logged = session.DB.SetLastQueryWithParams(query, args, connLabel)
 		p.server.PgRollback.PublishSessionUpdate(testID)
 	}
 	if p.IsMultiStatement(stmtName) {
@@ -393,11 +407,15 @@ func (p *proxyConnection) handleMessageExecute(testID string, msg *pgproto3.Exec
 	backendStmtName := p.backendStmtName(stmtName)
 	session.DB.LockRun()
 	start := time.Now()
-	err := p.executeViaExecPrepared(session.Context(), pgConn, backendStmtName, params, formatCodes, resultFormats)
+	dbElapsed, err := p.executeViaExecPrepared(session.Context(), pgConn, backendStmtName, params, formatCodes, resultFormats)
 	elapsed := time.Since(start)
 	session.DB.UnlockRun()
-	session.DB.Gui.UpdateLastQueryHistoryDuration(elapsed)
-	p.server.PgRollback.PublishSessionUpdate(testID)
+	// Skipped when SetLastQueryWithParams didn't append an entry (see ForwardCommandToDB for why
+	// that matters - this shared session's history can have other connections' entries as "last").
+	if logged {
+		session.DB.Gui.UpdateLastQueryHistoryDuration(elapsed, dbElapsed)
+		p.server.PgRollback.PublishSessionUpdate(testID)
+	}
 	if err != nil {
 		log.Printf("[PROXY] ExecPrepared failed: %v", err)
 		p.sendExtendedQueryErr(err)

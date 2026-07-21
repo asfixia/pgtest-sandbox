@@ -113,6 +113,51 @@ func TestSetLastQuery_SkipsEmpty(t *testing.T) {
 	}
 }
 
+// TestSetLastQuery_ReturnValueGatesFinalization is the regression test for a bug where a query's
+// logged duration could be silently replaced by an unrelated query's timing: SetLastQuery returns
+// false for noise (e.g. DEALLOCATE) without appending an entry, but call sites used to defer
+// UpdateLastQueryHistoryDuration unconditionally, which finalizes whatever is currently the last
+// history entry. In a session shared by multiple connections, a fast DEALLOCATE from one
+// connection could finalize a slow, still-running query's entry from another connection with the
+// DEALLOCATE's own (tiny) timing - e.g. "SELECT pg_sleep(10)" showing ~2ms instead of ~10s. Call
+// sites must call UpdateLastQueryHistoryDuration only when SetLastQuery (or SetLastQueryWithParams)
+// returned true; this test verifies that guarded pattern actually protects the entry.
+func TestSetLastQuery_ReturnValueGatesFinalization(t *testing.T) {
+	db := newTestSessionDB()
+
+	logged := db.Gui.SetLastQuery("SELECT pg_sleep(10)")
+	if !logged {
+		t.Fatal("SetLastQuery(real query) = false, want true")
+	}
+
+	// A second, unrelated connection on the same shared session sends a routine DEALLOCATE while
+	// the slow query above is still in flight. Per contract, callers must not finalize when this
+	// returns false.
+	noiseLogged := db.Gui.SetLastQuery("DEALLOCATE pdo_stmt_00000001")
+	if noiseLogged {
+		t.Fatal("SetLastQuery(DEALLOCATE) = true, want false (noise)")
+	}
+	// Correct call-site behavior: skip finalization entirely since noiseLogged is false.
+
+	hist := db.Gui.GetQueryHistory()
+	if len(hist) != 1 {
+		t.Fatalf("history len = %d, want 1 (DEALLOCATE must not append its own entry)", len(hist))
+	}
+	if !hist[0].Running {
+		t.Error("Running = false after unrelated DEALLOCATE was skipped, want true (pg_sleep still in flight)")
+	}
+	if hist[0].Duration != "" {
+		t.Errorf("Duration = %q after unrelated DEALLOCATE was skipped, want empty (must not be stomped)", hist[0].Duration)
+	}
+
+	// The real query now completes; only its own finalize call should ever touch its entry.
+	db.Gui.UpdateLastQueryHistoryDuration(10*time.Second, 10*time.Second)
+	hist = db.Gui.GetQueryHistory()
+	if hist[0].Duration != "10s" {
+		t.Errorf("Duration = %q, want %q (the real pg_sleep completion, not the DEALLOCATE's)", hist[0].Duration, "10s")
+	}
+}
+
 // --- Running state ---
 
 // TestSetLastQuery_MarksRunning verifies a query is logged as Running the moment it starts,
@@ -138,7 +183,7 @@ func TestSetLastQuery_MarksRunning(t *testing.T) {
 func TestUpdateLastQueryHistoryDuration_ClearsRunning(t *testing.T) {
 	db := newTestSessionDB()
 	db.Gui.SetLastQuery("SELECT 1")
-	db.Gui.UpdateLastQueryHistoryDuration(5 * time.Millisecond)
+	db.Gui.UpdateLastQueryHistoryDuration(5*time.Millisecond, 0)
 	hist := db.Gui.GetQueryHistory()
 	if len(hist) != 1 {
 		t.Fatalf("history len = %d, want 1", len(hist))
@@ -148,6 +193,45 @@ func TestUpdateLastQueryHistoryDuration_ClearsRunning(t *testing.T) {
 	}
 	if hist[0].Duration != "5ms" {
 		t.Errorf("Duration = %q, want %q", hist[0].Duration, "5ms")
+	}
+}
+
+// TestUpdateLastQueryHistoryDuration_SplitsDBAndProxyTime is the regression test for the
+// DB-vs-proxy-overhead breakdown shown in the GUI: DBDuration is exactly what was passed in, and
+// ProxyDuration is the remainder (total - DB), so the two together always sum back to Duration.
+func TestUpdateLastQueryHistoryDuration_SplitsDBAndProxyTime(t *testing.T) {
+	db := newTestSessionDB()
+	db.Gui.SetLastQuery("SELECT 1")
+	db.Gui.UpdateLastQueryHistoryDuration(10*time.Millisecond, 7*time.Millisecond)
+	hist := db.Gui.GetQueryHistory()
+	if len(hist) != 1 {
+		t.Fatalf("history len = %d, want 1", len(hist))
+	}
+	if hist[0].Duration != "10ms" {
+		t.Errorf("Duration = %q, want %q", hist[0].Duration, "10ms")
+	}
+	if hist[0].DBDuration != "7ms" {
+		t.Errorf("DBDuration = %q, want %q", hist[0].DBDuration, "7ms")
+	}
+	if hist[0].ProxyDuration != "3ms" {
+		t.Errorf("ProxyDuration = %q, want %q (Duration - DBDuration)", hist[0].ProxyDuration, "3ms")
+	}
+}
+
+// TestUpdateLastQueryHistoryDuration_UntrackedDBTimeLeavesFieldsEmpty verifies the dbElapsed<=0
+// sentinel (used by call sites that cannot cleanly attribute DB time, e.g. a composite
+// multi-statement batch delegated to per-command sub-entries) reports "not tracked" rather than a
+// misleading 0ms DB / 100% proxy-overhead split.
+func TestUpdateLastQueryHistoryDuration_UntrackedDBTimeLeavesFieldsEmpty(t *testing.T) {
+	db := newTestSessionDB()
+	db.Gui.SetLastQuery("SELECT 1")
+	db.Gui.UpdateLastQueryHistoryDuration(10*time.Millisecond, 0)
+	hist := db.Gui.GetQueryHistory()
+	if hist[0].DBDuration != "" {
+		t.Errorf("DBDuration = %q, want empty (untracked)", hist[0].DBDuration)
+	}
+	if hist[0].ProxyDuration != "" {
+		t.Errorf("ProxyDuration = %q, want empty (untracked)", hist[0].ProxyDuration)
 	}
 }
 

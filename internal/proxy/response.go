@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"time"
 
 	"pgrollback/pkg/protocol"
 	"pgrollback/pkg/sql"
@@ -15,7 +16,7 @@ import (
 
 // SendSelectResults itera sobre as linhas de um resultado pgx e envia para o cliente.
 // Envia RowDescription e DataRow(s), seguido de CommandComplete.
-func (p *proxyConnection) SendSelectResults(rows pgx.Rows) error {
+func (p *proxyConnection) SendSelectResults(rows pgx.Rows) (time.Duration, error) {
 	return p.SendSelectResultsWithQuery(rows, "")
 }
 
@@ -69,15 +70,26 @@ func resolveFieldDescriptions(query string, rows pgx.Rows) (fields []pgproto3.Fi
 
 // SendSelectResultsWithQuery envia resultados; se query tiver RETURNING, usa o mesmo RowDescription
 // sintético do Describe para que clientes (ex.: PHP PDO) que dependem da consistência recebam a linha.
-func (p *proxyConnection) SendSelectResultsWithQuery(rows pgx.Rows, query string) error {
+//
+// Returns dbWait: time spent inside rows.Next() (waiting on/reading from PostgreSQL), separate from
+// the row-conversion and backend.Send() calls in the same loop (proxy-side work), so callers can
+// report accurate DB-vs-proxy-overhead timing even though both happen interleaved per row.
+func (p *proxyConnection) SendSelectResultsWithQuery(rows pgx.Rows, query string) (time.Duration, error) {
 	fields, returnOIDs, returnsSet := resolveFieldDescriptions(query, rows)
 	if os.Getenv("PGROLLBACK_LOG_MESSAGE_ORDER") == "1" {
 		log.Printf("[MSG_ORDER] SEND RowDescription: %d cols", len(fields))
 	}
 	p.backend.Send(&pgproto3.RowDescription{Fields: fields})
 
+	var dbWait time.Duration
 	rowCount := 0
-	for rows.Next() {
+	for {
+		t0 := time.Now()
+		hasNext := rows.Next()
+		dbWait += time.Since(t0)
+		if !hasNext {
+			break
+		}
 		rowCount++
 		rawValues := rows.RawValues()
 		if len(returnOIDs) > 0 && len(rawValues) == len(returnOIDs) {
@@ -107,9 +119,9 @@ func (p *proxyConnection) SendSelectResultsWithQuery(rows pgx.Rows, query string
 	}
 	p.backend.Send(&pgproto3.CommandComplete{CommandTag: []byte(fmt.Sprintf("SELECT %d", rowCount))})
 	if err := p.backend.Flush(); err != nil {
-		return fmt.Errorf("falha no flush dos resultados do select: %w", err)
+		return dbWait, fmt.Errorf("falha no flush dos resultados do select: %w", err)
 	}
-	return nil
+	return dbWait, nil
 }
 
 // SendCommandComplete envia a mensagem de completamento de comando.

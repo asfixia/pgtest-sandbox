@@ -299,7 +299,10 @@ func (p *PgRollback) sessionInfoWithoutLockStatus(testID string) (gui.SessionInf
 		entries := session.DB.Gui.GetQueryHistory()
 		queryHistory = make([]gui.QueryHistoryItem, len(entries))
 		for i, e := range entries {
-			queryHistory[i] = gui.QueryHistoryItem{Query: e.Query, At: e.At.Format(time.RFC3339), Duration: e.Duration, Running: e.Running}
+			queryHistory[i] = gui.QueryHistoryItem{
+				Query: e.Query, At: e.At.Format(time.RFC3339), Duration: e.Duration,
+				DBDuration: e.DBDuration, ProxyDuration: e.ProxyDuration, Running: e.Running,
+			}
 		}
 		if n := len(queryHistory); n > 0 {
 			running = queryHistory[n-1].Running

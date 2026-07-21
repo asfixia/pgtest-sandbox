@@ -199,3 +199,66 @@ func TestProxyGUIQueryHistoryDurationPgSleep(t *testing.T) {
 		})
 	}
 }
+
+// TestProxyGUIQueryHistoryDBProxyDurationSplit verifies the DB-vs-proxy-overhead breakdown added
+// alongside query timing: for a query that is almost entirely spent waiting on PostgreSQL
+// (pg_sleep), DBDuration should track the total closely and ProxyDuration should be small - the
+// sanity check that DB time is measuring the real backend round trip, not just mirroring the total.
+func TestProxyGUIQueryHistoryDBProxyDurationSplit(t *testing.T) {
+	cfg := getConfigForProxyTest(t)
+	if cfg == nil {
+		return
+	}
+	if !isPostgreSQLAvailable(t, cfg.Postgres.Host, cfg.Postgres.Port, cfg.Postgres.Database, cfg.Postgres.User, cfg.Postgres.Password) {
+		t.Skipf("Skipping test - PostgreSQL is not available at %s:%d", cfg.Postgres.Host, cfg.Postgres.Port)
+		return
+	}
+
+	testID := "gui_hist_dbproxy_split"
+	db, ctx, server, cleanup := connectToProxyForTestWithServer(t, testID)
+	defer cleanup()
+	if db == nil || server == nil {
+		return
+	}
+
+	sess := server.PgRollback.GetSession(testID)
+	if sess == nil {
+		t.Fatal("expected session after connect")
+	}
+
+	marker := "pg_sleep_dbproxy_split"
+	query := fmt.Sprintf("SELECT pg_sleep(1) -- %s", marker)
+
+	qctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if _, err := db.ExecContext(qctx, query); err != nil {
+		t.Fatalf("pg_sleep query: %v", err)
+	}
+
+	entry := waitForQueryHistoryComplete(t, sess, marker, 3*time.Second)
+
+	if entry.DBDuration == "" {
+		t.Fatal("DBDuration is empty, want a tracked value for a direct pg_sleep query")
+	}
+	if entry.ProxyDuration == "" {
+		t.Fatal("ProxyDuration is empty, want a tracked value for a direct pg_sleep query")
+	}
+
+	total := parseLoggedQueryDuration(t, entry.Duration)
+	dbTime := parseLoggedQueryDuration(t, entry.DBDuration)
+	proxyTime := parseLoggedQueryDuration(t, entry.ProxyDuration)
+
+	if dbTime+proxyTime != total {
+		t.Errorf("DBDuration + ProxyDuration = %v, want exactly Duration = %v", dbTime+proxyTime, total)
+	}
+	// pg_sleep(1) spends essentially all its time waiting on PostgreSQL, so DB time should
+	// dominate and proxy overhead should be a small fraction of the 1s sleep.
+	if dbTime < 900*time.Millisecond {
+		t.Errorf("DBDuration = %v, want close to the 1s pg_sleep (proxy overhead should be small)", dbTime)
+	}
+	if proxyTime > 100*time.Millisecond {
+		t.Errorf("ProxyDuration = %v, want < 100ms of proxy overhead for a single pg_sleep query", proxyTime)
+	}
+
+	t.Logf("pg_sleep(1): total=%v db=%v proxy=%v", total, dbTime, proxyTime)
+}

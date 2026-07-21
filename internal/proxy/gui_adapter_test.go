@@ -157,7 +157,7 @@ func TestSessionProviderAdapter_GetSessions_RunningReflectsInFlightQuery(t *test
 		t.Errorf("QueryHistory[0].Running = %v, want true", list[0].QueryHistory)
 	}
 
-	sess.DB.Gui.UpdateLastQueryHistoryDuration(5 * time.Millisecond)
+	sess.DB.Gui.UpdateLastQueryHistoryDuration(5*time.Millisecond, 0)
 	list = a.GetSessions()
 	if list[0].Running {
 		t.Error("SessionInfo.Running = true after query finished, want false")

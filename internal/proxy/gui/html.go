@@ -187,6 +187,14 @@ const htmlTemplate = `<!DOCTYPE html>
     }
     .query-duration { color: #64748b; font-weight: 500; margin-left: 0.25rem; }
     .query-duration.running { color: #f59e0b; }
+    .query-db-proxy-split {
+      color: #64748b;
+      font-size: 0.75rem;
+      margin-left: 0.4rem;
+      font-family: 'Consolas', 'Monaco', ui-monospace, monospace;
+    }
+    .query-db-proxy-split .db-part { color: #38bdf8; }
+    .query-db-proxy-split .proxy-part { color: #fb923c; }
     .actions { white-space: nowrap; }
     .history-btn, .close-btn, .clear-log-btn {
       padding: 0.35rem 0.75rem;
@@ -347,6 +355,49 @@ const htmlTemplate = `<!DOCTYPE html>
     .modal-actions .save-btn:hover { background: #0284c7; }
     .modal-actions .cancel-btn { background: #475569; color: #e2e8f0; }
     .modal-actions .cancel-btn:hover { background: #64748b; }
+    .section .hint { font-size: 0.75rem; color: #64748b; margin-top: 0.5rem; line-height: 1.4; }
+    .dur-color-preview {
+      height: 0.5rem;
+      border-radius: 999px;
+      margin-top: 0.65rem;
+      border: 1px solid rgba(51, 65, 85, 0.6);
+    }
+    .dur-color-stops { margin-top: 0.65rem; display: flex; flex-direction: column; gap: 0.4rem; }
+    .dur-color-stop { display: flex; align-items: center; gap: 0.5rem; }
+    .dur-color-stop input[type="text"] { flex: 1; margin-top: 0; }
+    .dur-color-stop input[type="color"] {
+      width: 2.6rem;
+      height: 1.9rem;
+      padding: 0.15rem;
+      margin-top: 0;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      background: #0f172a;
+      cursor: pointer;
+    }
+    .dur-color-stop input.invalid { border-color: #ef4444; }
+    .dur-color-stop-remove {
+      background: transparent;
+      color: #fca5a5;
+      border: 1px solid #7f1d1d;
+      border-radius: 6px;
+      padding: 0.3rem 0.55rem;
+      cursor: pointer;
+      font-size: 0.75rem;
+      line-height: 1;
+    }
+    .dur-color-stop-remove:hover { background: rgba(185, 28, 28, 0.15); }
+    .dur-color-add-btn {
+      margin-top: 0.65rem;
+      padding: 0.35rem 0.75rem;
+      background: transparent;
+      color: #94a3b8;
+      border: 1px dashed #475569;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 0.8125rem;
+    }
+    .dur-color-add-btn:hover { color: #cbd5e1; border-color: #64748b; }
   </style>
 </head>
 <body>
@@ -418,6 +469,23 @@ const htmlTemplate = `<!DOCTYPE html>
           <button type="button" id="settingsModalCancel" class="cancel-btn">Cancel</button>
         </div>
       </form>
+      <div class="section" id="durationColorSection">
+        <div class="section-title">Query duration colors</div>
+        <label>Style
+          <select id="durColorPreset">
+            <option value="full">Full range (0ms &ndash; 1m)</option>
+            <option value="optimized">Optimized queries (0ms &ndash; 20s)</option>
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+        <div class="dur-color-preview" id="durColorPreview"></div>
+        <div class="dur-color-stops" id="durColorStops"></div>
+        <button type="button" class="dur-color-add-btn" id="durColorAddStop">+ Add color stop</button>
+        <div class="hint">Colors each query's duration text from blue (fast) to red (at or beyond the last stop). Times accept ms/s/m, e.g. "500ms", "10s", "1m". Saved in this browser only.</div>
+        <div class="modal-actions">
+          <button type="button" class="save-btn" id="durColorSave">Save colors</button>
+        </div>
+      </div>
     </div>
   </div>
   <script>
@@ -509,17 +577,202 @@ const htmlTemplate = `<!DOCTYPE html>
       var s = totalSec % 60;
       return 'running ' + (m > 0 ? (m + 'm ' + s + 's') : (s + 's'));
     }
+
+    // --- Query duration color scale: colors each duration badge's text from blue (fast) to red
+    // (at/beyond the last configured stop). Purely a per-browser display preference (localStorage),
+    // not server config - each developer reads logs differently, and there's no server-side
+    // consumer of this value.
+    var DURATION_COLOR_STORAGE_KEY = 'pgrollback_duration_color_scale';
+    var DURATION_COLOR_PRESETS = {
+      full: [
+        { ms: 0, color: '#3b82f6' },
+        { ms: 12000, color: '#22d3ee' },
+        { ms: 24000, color: '#4ade80' },
+        { ms: 36000, color: '#facc15' },
+        { ms: 48000, color: '#fb923c' },
+        { ms: 60000, color: '#ef4444' }
+      ],
+      optimized: [
+        { ms: 0, color: '#3b82f6' },
+        { ms: 4000, color: '#22d3ee' },
+        { ms: 8000, color: '#4ade80' },
+        { ms: 12000, color: '#facc15' },
+        { ms: 16000, color: '#fb923c' },
+        { ms: 20000, color: '#ef4444' }
+      ]
+    };
+    function clonePreset(name) {
+      return DURATION_COLOR_PRESETS[name].map(function(s) { return { ms: s.ms, color: s.color }; });
+    }
+    function presetMatches(name, stops) {
+      var preset = DURATION_COLOR_PRESETS[name];
+      if (!stops || stops.length !== preset.length) return false;
+      for (var i = 0; i < preset.length; i++) {
+        if (stops[i].ms !== preset[i].ms || stops[i].color.toLowerCase() !== preset[i].color.toLowerCase()) return false;
+      }
+      return true;
+    }
+    function detectPreset(stops) {
+      if (presetMatches('full', stops)) return 'full';
+      if (presetMatches('optimized', stops)) return 'optimized';
+      return 'custom';
+    }
+    function loadDurationColorState() {
+      try {
+        var raw = localStorage.getItem(DURATION_COLOR_STORAGE_KEY);
+        if (raw) {
+          var parsed = JSON.parse(raw);
+          if (parsed && Array.isArray(parsed.stops)) {
+            var stops = parsed.stops.filter(function(s) { return s && isFinite(s.ms) && typeof s.color === 'string'; });
+            if (stops.length >= 2) return { stops: stops };
+          }
+        }
+      } catch (e) {}
+      return { stops: clonePreset('full') };
+    }
+    var durationColorState = loadDurationColorState();
+    function saveDurationColorState(stops) {
+      durationColorState = { stops: stops };
+      try { localStorage.setItem(DURATION_COLOR_STORAGE_KEY, JSON.stringify(durationColorState)); } catch (e) {}
+    }
+    function hexToRgb(hex) {
+      var h = (hex || '').replace('#', '');
+      if (h.length === 3) h = h.split('').map(function(c) { return c + c; }).join('');
+      var n = parseInt(h, 16);
+      if (isNaN(n)) return { r: 148, g: 163, b: 184 };
+      return { r: (n >> 16) & 255, g: (n >> 8) & 255, b: n & 255 };
+    }
+    function rgbToHex(r, g, b) {
+      function h(v) { v = Math.max(0, Math.min(255, Math.round(v))); var s = v.toString(16); return s.length === 1 ? '0' + s : s; }
+      return '#' + h(r) + h(g) + h(b);
+    }
+    // Interpolates the configured stops for a given elapsed time in ms; clamps to the first/last
+    // color outside the configured range (so anything at or beyond the last stop reads as fully "hot").
+    function colorForDurationMs(ms) {
+      var stops = (durationColorState.stops || []).slice().sort(function(a, b) { return a.ms - b.ms; });
+      if (!stops.length || !isFinite(ms)) return null;
+      if (ms <= stops[0].ms) return stops[0].color;
+      if (ms >= stops[stops.length - 1].ms) return stops[stops.length - 1].color;
+      for (var i = 0; i < stops.length - 1; i++) {
+        var a = stops[i], b = stops[i + 1];
+        if (ms >= a.ms && ms <= b.ms) {
+          var t = (b.ms === a.ms) ? 0 : (ms - a.ms) / (b.ms - a.ms);
+          var ca = hexToRgb(a.color), cb = hexToRgb(b.color);
+          return rgbToHex(ca.r + (cb.r - ca.r) * t, ca.g + (cb.g - ca.g) * t, ca.b + (cb.b - ca.b) * t);
+        }
+      }
+      return stops[stops.length - 1].color;
+    }
+    // Converts a Go time.Duration.String() value (e.g. "142µs", "1.81ms", "10.0093244s") to
+    // milliseconds. Go only switches to a compound "1m0s" / "2h3m4s" style at >= 1 minute, so any
+    // string that doesn't match the single-unit pattern below is treated as >= 60000ms - correct
+    // since the color scale clamps to the last stop's color at/beyond its own max anyway.
+    function durationStringToMs(raw) {
+      if (!raw || typeof raw !== 'string') return null;
+      var s = raw.trim();
+      if (!s) return null;
+      var m = s.match(/^([\d.]+)\s*(ns|µs|us|μs|ms|s)$/);
+      if (!m) return /^\d/.test(s) ? 60000 : null;
+      var v = parseFloat(m[1]);
+      if (!isFinite(v)) return null;
+      switch (m[2]) {
+        case 'ns': return v / 1e6;
+        case 'µs': case 'us': case 'μs': return v / 1000;
+        case 'ms': return v;
+        case 's': return v * 1000;
+      }
+      return null;
+    }
+    // Parses a user-typed stop time like "500ms", "10s", "1m30s", or a bare number (ms) into ms.
+    function parseDurationToMs(s) {
+      if (s == null) return NaN;
+      s = String(s).trim();
+      if (s === '') return NaN;
+      if (/^\d+(\.\d+)?$/.test(s)) return parseFloat(s);
+      var total = 0, matched = false, re = /(\d+(?:\.\d+)?)\s*(ms|h|m|s)/gi, m;
+      while ((m = re.exec(s))) {
+        matched = true;
+        var val = parseFloat(m[1]), unit = m[2].toLowerCase();
+        if (unit === 'ms') total += val;
+        else if (unit === 's') total += val * 1000;
+        else if (unit === 'm') total += val * 60000;
+        else if (unit === 'h') total += val * 3600000;
+      }
+      return matched ? total : NaN;
+    }
+    function formatMsAsLabel(ms) {
+      if (ms === 0) return '0ms';
+      if (ms < 1000) return (Math.round(ms * 100) / 100) + 'ms';
+      if (ms < 60000) return (Math.round((ms / 1000) * 100) / 100) + 's';
+      var m = Math.floor(ms / 60000), rem = Math.round((ms % 60000) / 1000);
+      return rem ? (m + 'm' + rem + 's') : (m + 'm');
+    }
+    var pendingDurationColorStops = [];
+    function updateDurationColorPreview() {
+      var preview = document.getElementById('durColorPreview');
+      if (!preview) return;
+      var stops = pendingDurationColorStops.slice().sort(function(a, b) { return a.ms - b.ms; });
+      if (!stops.length) { preview.style.background = 'transparent'; return; }
+      var maxMs = stops[stops.length - 1].ms || 1;
+      var parts = stops.map(function(s) { return s.color + ' ' + Math.round((s.ms / maxMs) * 100) + '%'; });
+      preview.style.background = 'linear-gradient(90deg, ' + parts.join(', ') + ')';
+    }
+    function renderDurationColorEditor() {
+      var wrap = document.getElementById('durColorStops');
+      var presetSelect = document.getElementById('durColorPreset');
+      if (!wrap) return;
+      wrap.innerHTML = '';
+      pendingDurationColorStops.forEach(function(stop, idx) {
+        var row = document.createElement('div');
+        row.className = 'dur-color-stop';
+        row.innerHTML =
+          '<input type="text" class="dur-stop-time" value="' + escapeHtml(formatMsAsLabel(stop.ms)) + '" placeholder="e.g. 5s">' +
+          '<input type="color" class="dur-stop-color" value="' + stop.color + '">' +
+          '<button type="button" class="dur-color-stop-remove" title="Remove stop">✕</button>';
+        var timeInput = row.querySelector('.dur-stop-time');
+        var colorInput = row.querySelector('.dur-stop-color');
+        var removeBtn = row.querySelector('.dur-color-stop-remove');
+        timeInput.addEventListener('change', function() {
+          var parsed = parseDurationToMs(timeInput.value);
+          if (isNaN(parsed) || parsed < 0) { timeInput.classList.add('invalid'); return; }
+          pendingDurationColorStops[idx].ms = parsed;
+          pendingDurationColorStops.sort(function(a, b) { return a.ms - b.ms; });
+          if (presetSelect) presetSelect.value = detectPreset(pendingDurationColorStops);
+          renderDurationColorEditor();
+        });
+        colorInput.addEventListener('input', function() {
+          pendingDurationColorStops[idx].color = colorInput.value;
+          if (presetSelect) presetSelect.value = detectPreset(pendingDurationColorStops);
+          updateDurationColorPreview();
+        });
+        removeBtn.addEventListener('click', function() {
+          if (pendingDurationColorStops.length <= 2) { alert('At least 2 color stops are required.'); return; }
+          pendingDurationColorStops.splice(idx, 1);
+          if (presetSelect) presetSelect.value = detectPreset(pendingDurationColorStops);
+          renderDurationColorEditor();
+        });
+        wrap.appendChild(row);
+      });
+      updateDurationColorPreview();
+    }
     // Returns the "(12.345ms)" / "(running...)" badge for a query. While running, the span carries
     // data-started-at (ms epoch) so tickRunningIndicators() can update the live elapsed time without
-    // a full re-render (the row otherwise only updates on the next start/finish push event).
+    // a full re-render (the row otherwise only updates on the next start/finish push event). Both
+    // states get a text color from the duration scale so a running query visibly heats up over time.
     function durationOrRunningHtml(running, startedAtRaw, durationRaw) {
       if (running) {
         var ts = startedAtRaw ? (new Date(startedAtRaw)).getTime() : NaN;
         var attr = (ts && !isNaN(ts)) ? (' data-started-at="' + ts + '"') : '';
-        return ' <span class="query-duration running"' + attr + '>(running…)</span>';
+        var liveColor = (ts && !isNaN(ts)) ? colorForDurationMs(Date.now() - ts) : null;
+        var runStyle = liveColor ? (' style="color:' + liveColor + '"') : '';
+        return ' <span class="query-duration running"' + attr + runStyle + '>(running…)</span>';
       }
       var d = formatDuration(durationRaw);
-      return (d && d.trim()) ? (' <span class="query-duration">(' + escapeHtml(d) + ')</span>') : '';
+      if (!d || !d.trim()) return '';
+      var ms = durationStringToMs(durationRaw);
+      var color = (ms != null) ? colorForDurationMs(ms) : null;
+      var style = color ? (' style="color:' + color + '"') : '';
+      return ' <span class="query-duration"' + style + '>(' + escapeHtml(d) + ')</span>';
     }
     function tickRunningIndicators() {
       var now = Date.now();
@@ -527,20 +780,34 @@ const htmlTemplate = `<!DOCTYPE html>
         var startedAt = parseInt(el.getAttribute('data-started-at'), 10);
         if (!startedAt || isNaN(startedAt)) return;
         el.textContent = '(' + formatElapsedMs(now - startedAt) + ')';
+        var color = colorForDurationMs(now - startedAt);
+        if (color) el.style.color = color;
       });
+    }
+    // Renders "[db 10.1ms / proxy 2.2ms]" next to a finished query's duration so it's clear how
+    // much of the total time was the real PostgreSQL round trip vs. the proxy's own processing
+    // (interception, protocol handling, GUI logging). Empty when not tracked for this entry (see
+    // DBDuration on proxy.QueryHistoryEntry) - e.g. a composite multi-statement batch.
+    function dbProxyBreakdownHtml(item) {
+      if (!item || !item.db_duration || !item.proxy_duration) return '';
+      var db = escapeHtml(formatDuration(item.db_duration));
+      var proxyD = escapeHtml(formatDuration(item.proxy_duration));
+      return ' <span class="query-db-proxy-split" title="Time in the real PostgreSQL round trip vs. proxy-side processing (query interception, protocol handling, GUI logging)">[db <span class="db-part">' + db + '</span> / proxy <span class="proxy-part">' + proxyD + '</span>]</span>';
     }
     function historyItemHtml(item) {
       var query = '';
       var at = '';
       var dur = '';
+      var split = '';
       if (item && typeof item === 'object' && item.query !== undefined) {
         query = item.query || '';
         at = item.at ? '<span class="qtime">' + escapeHtml(formatHistoryAt(item.at)) + '</span>' : '';
         dur = durationOrRunningHtml(item.running === true, item.at, item.duration);
+        split = dbProxyBreakdownHtml(item);
       } else {
         query = typeof item === 'string' ? item : '';
       }
-      return at + dur + ' ' + escapeHtml(prettySql(query));
+      return at + dur + split + ' ' + escapeHtml(prettySql(query));
     }
     var openHistoryIds = {};
     var historyScrollTops = {};
@@ -694,7 +961,9 @@ const htmlTemplate = `<!DOCTYPE html>
     function historyListMatches(a, b) {
       if (a.length !== b.length) return false;
       for (var i = 0; i < a.length; i++) {
-        if (a[i].query !== b[i].query || a[i].at !== b[i].at || a[i].duration !== b[i].duration || a[i].running !== b[i].running) return false;
+        if (a[i].query !== b[i].query || a[i].at !== b[i].at || a[i].duration !== b[i].duration ||
+            a[i].db_duration !== b[i].db_duration || a[i].proxy_duration !== b[i].proxy_duration ||
+            a[i].running !== b[i].running) return false;
       }
       return true;
     }
