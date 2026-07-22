@@ -583,22 +583,37 @@ const htmlTemplate = `<!DOCTYPE html>
     // not server config - each developer reads logs differently, and there's no server-side
     // consumer of this value.
     var DURATION_COLOR_STORAGE_KEY = 'pgrollback_duration_color_scale';
+    // 12 stops each, evenly spaced across the preset's range, interpolated in HSL from blue
+    // (hue 217) to red (hue 0) at fixed saturation/lightness - a smooth blue->cyan->green->
+    // yellow->orange->red ramp rather than 6 hand-picked anchor colors.
     var DURATION_COLOR_PRESETS = {
       full: [
-        { ms: 0, color: '#3b82f6' },
-        { ms: 12000, color: '#22d3ee' },
-        { ms: 24000, color: '#4ade80' },
-        { ms: 36000, color: '#facc15' },
-        { ms: 48000, color: '#fb923c' },
-        { ms: 60000, color: '#ef4444' }
+        { ms: 300, color: '#3c83f6' },
+        { ms: 1000, color: '#3cc0f6' },
+        { ms: 2000, color: '#3cf6ee' },
+        { ms: 6000, color: '#3cf6b1' },
+        { ms: 15000, color: '#3cf674' },
+        { ms: 22000, color: '#41f63c' },
+        { ms: 30000, color: '#7ef63c' },
+        { ms: 38182, color: '#bbf63c' },
+        { ms: 43636, color: '#f6f33c' },
+        { ms: 49091, color: '#f6b63c' },
+        { ms: 54545, color: '#f6793c' },
+        { ms: 60000, color: '#f63c3c' }
       ],
       optimized: [
-        { ms: 0, color: '#3b82f6' },
-        { ms: 4000, color: '#22d3ee' },
-        { ms: 8000, color: '#4ade80' },
-        { ms: 12000, color: '#facc15' },
-        { ms: 16000, color: '#fb923c' },
-        { ms: 20000, color: '#ef4444' }
+        { ms: 200, color: '#3c83f6' },
+        { ms: 500, color: '#3cc0f6' },
+        { ms: 1000, color: '#3cf6ee' },
+        { ms: 2000, color: '#3cf6b1' },
+        { ms: 5000, color: '#3cf674' },
+        { ms: 7000, color: '#41f63c' },
+        { ms: 10000, color: '#7ef63c' },
+        { ms: 12727, color: '#bbf63c' },
+        { ms: 14545, color: '#f6f33c' },
+        { ms: 16364, color: '#f6b63c' },
+        { ms: 18182, color: '#f6793c' },
+        { ms: 20000, color: '#f63c3c' }
       ]
     };
     function clonePreset(name) {
@@ -1080,9 +1095,43 @@ const htmlTemplate = `<!DOCTYPE html>
     // query is just sitting there running).
     setInterval(tickRunningIndicators, 1000);
 
+    var durColorPresetSelect = document.getElementById('durColorPreset');
+    if (durColorPresetSelect) {
+      durColorPresetSelect.addEventListener('change', function() {
+        var v = durColorPresetSelect.value;
+        if (v === 'full' || v === 'optimized') {
+          pendingDurationColorStops = clonePreset(v);
+          renderDurationColorEditor();
+        }
+      });
+    }
+    var durColorAddStopBtn = document.getElementById('durColorAddStop');
+    if (durColorAddStopBtn) {
+      durColorAddStopBtn.addEventListener('click', function() {
+        var last = pendingDurationColorStops[pendingDurationColorStops.length - 1];
+        var nextMs = last ? last.ms + 5000 : 0;
+        pendingDurationColorStops.push({ ms: nextMs, color: '#94a3b8' });
+        if (durColorPresetSelect) durColorPresetSelect.value = detectPreset(pendingDurationColorStops);
+        renderDurationColorEditor();
+      });
+    }
+    var durColorSaveBtn = document.getElementById('durColorSave');
+    if (durColorSaveBtn) {
+      durColorSaveBtn.addEventListener('click', function() {
+        var stops = pendingDurationColorStops
+          .map(function(s) { return { ms: s.ms, color: s.color }; })
+          .sort(function(a, b) { return a.ms - b.ms; });
+        if (stops.length < 2) { alert('At least 2 color stops are required.'); return; }
+        saveDurationColorState(stops);
+        if (lastRenderedSessions) fullReplace(lastRenderedSessions); else load();
+      });
+    }
     if (settingsBtn && settingsModal) {
       settingsBtn.addEventListener('click', function() {
         settingsModal.classList.add('visible');
+        pendingDurationColorStops = durationColorState.stops.map(function(s) { return { ms: s.ms, color: s.color }; });
+        if (durColorPresetSelect) durColorPresetSelect.value = detectPreset(pendingDurationColorStops);
+        renderDurationColorEditor();
         fetch('__API_BASE__/config').then(function(r) { return r.json(); }).then(function(data) {
           if (data.error) { alert(data.error); return; }
           applyConfigMeta(data);

@@ -117,4 +117,51 @@ assert(tbodyEl.innerHTML.indexOf(marker) !== -1,
 assert(tbodyEl.innerHTML.indexOf('db') !== -1 && tbodyEl.innerHTML.indexOf('proxy') !== -1,
   'rendered table HTML must show the db/proxy duration breakdown when the entry carries one');
 
+// --- Query duration color scale ---
+
+assert(typeof durationStringToMs === 'function', 'durationStringToMs must be defined');
+assert(durationStringToMs('142µs') === 0.142, 'durationStringToMs must parse µs (' + durationStringToMs('142µs') + ')');
+assert(durationStringToMs('1.81ms') === 1.81, 'durationStringToMs must parse ms');
+assert(Math.abs(durationStringToMs('10.0093244s') - 10009.3244) < 1e-6, 'durationStringToMs must parse s');
+assert(durationStringToMs('1m0s') === 60000, 'durationStringToMs must treat compound (>=1m) Go durations as 60000ms');
+assert(durationStringToMs('') === null, 'durationStringToMs must return null for empty input');
+
+assert(typeof parseDurationToMs === 'function', 'parseDurationToMs must be defined');
+assert(parseDurationToMs('500ms') === 500, 'parseDurationToMs must parse ms');
+assert(parseDurationToMs('10s') === 10000, 'parseDurationToMs must parse s');
+assert(parseDurationToMs('1m') === 60000, 'parseDurationToMs must parse m');
+assert(isNaN(parseDurationToMs('bogus')), 'parseDurationToMs must reject unparseable input');
+
+// durationColorState defaults to the "full range" preset since this Node shim has no
+// localStorage. Read expected colors from DURATION_COLOR_PRESETS itself (defined in the real
+// script, not re-declared here) so this test tracks html.go's actual stops instead of a second,
+// hand-copied set of hex values that would silently drift out of sync.
+assert(typeof colorForDurationMs === 'function', 'colorForDurationMs must be defined');
+assert(typeof DURATION_COLOR_PRESETS === 'object' && Array.isArray(DURATION_COLOR_PRESETS.full),
+  'DURATION_COLOR_PRESETS.full must be defined');
+var fullStops = DURATION_COLOR_PRESETS.full;
+var firstStop = fullStops[0];
+var lastStop = fullStops[fullStops.length - 1];
+assert(colorForDurationMs(firstStop.ms).toLowerCase() === firstStop.color.toLowerCase(),
+  'colorForDurationMs must match the first stop\'s color exactly at its own ms');
+assert(colorForDurationMs(lastStop.ms).toLowerCase() === lastStop.color.toLowerCase(),
+  'colorForDurationMs must match the last stop\'s color exactly at its own ms');
+assert(colorForDurationMs(lastStop.ms * 10).toLowerCase() === lastStop.color.toLowerCase(),
+  'colorForDurationMs must clamp to the last stop\'s color beyond it');
+(function () {
+  var midMs = (firstStop.ms + lastStop.ms) / 2;
+  var mid = colorForDurationMs(midMs);
+  assert(typeof mid === 'string' && mid[0] === '#' && mid.length === 7, 'colorForDurationMs must return a hex color mid-scale');
+  assert(mid.toLowerCase() !== firstStop.color.toLowerCase() && mid.toLowerCase() !== lastStop.color.toLowerCase(),
+    'colorForDurationMs at the midpoint must differ from both endpoints');
+})();
+assert(DURATION_COLOR_PRESETS.full.length >= 2, '"full" preset must have at least 2 color stops');
+assert(DURATION_COLOR_PRESETS.optimized.length >= 2, '"optimized" preset must have at least 2 color stops');
+
+// durationOrRunningHtml must attach a scale color to a finished query's duration badge.
+(function () {
+  var html = durationOrRunningHtml(false, null, '1.234ms');
+  assert(html.indexOf('style="color:') !== -1, 'finished duration badge must carry an inline scale color: ' + html);
+})();
+
 console.log('OK');
