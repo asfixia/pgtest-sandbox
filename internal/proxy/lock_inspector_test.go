@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
+
+	"pgrollback/internal/config"
+	"pgrollback/internal/testutil"
 )
 
 func TestIsPgrollbackApplicationName(t *testing.T) {
@@ -49,8 +51,7 @@ func TestTestIDFromPgrollbackAppName(t *testing.T) {
 // connection after the first catalog query does not panic on the second query (regression
 // for stale *pgx.Conn pointer reuse after invalidateConn).
 func TestLookupSurvivesClosedConnBetweenQueries(t *testing.T) {
-	host, port, database, user, password := postgresEnvOrFail(t)
-
+	host, port, database, user, password := postgresFromConfigOrFail(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -78,27 +79,24 @@ func TestLookupSurvivesClosedConnBetweenQueries(t *testing.T) {
 	li.lookup(context.Background(), []string{"pgrollback-parque-cafeeiro"})
 }
 
-func postgresEnvOrFail(t *testing.T) (host string, port int, database, user, password string) {
+// postgresFromConfigOrFail loads Postgres settings from PGROLLBACK_CONFIG (or default
+// config/pgrollback.yaml), with POSTGRES_* env overrides — same as the rest of the test suite.
+func postgresFromConfigOrFail(t *testing.T) (host string, port int, database, user, password string) {
 	t.Helper()
-	host = requireEnv(t, "POSTGRES_HOST")
-	database = requireEnv(t, "POSTGRES_DB")
-	user = requireEnv(t, "POSTGRES_USER")
-	password = requireEnv(t, "POSTGRES_PASSWORD")
-	return host, 5433, database, user, password
-}
-
-func requireEnv(t *testing.T, key string) string {
-	t.Helper()
-	v := os.Getenv(key)
-	if v == "" {
-		t.Fatalf("missing required environment variable %s", key)
+	path := testutil.ConfigPath()
+	cfg, err := config.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("load config %s: %v", path, err)
 	}
-	return v
+	p := cfg.Postgres
+	if p.Host == "" || p.Port == 0 || p.Database == "" || p.User == "" {
+		t.Fatalf("postgres settings incomplete in config %s", path)
+	}
+	return p.Host, p.Port, p.Database, p.User, p.Password
 }
 
 func TestEnsureConnLockedReconnectsAfterInvalidate(t *testing.T) {
-	host, port, database, user, password := postgresEnvOrFail(t)
-
+	host, port, database, user, password := postgresFromConfigOrFail(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
