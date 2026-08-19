@@ -150,14 +150,8 @@ func (li *lockInspector) lookup(ctx context.Context, appNames []string) map[stri
 	qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	conn, err := li.ensureConnLocked(qctx)
-	if err != nil {
-		li.unavailableUntil = time.Now().Add(15 * time.Second)
-		return out
-	}
-
-	li.fillFromBlockingLocks(qctx, conn, unique, out)
-	li.fillFromWaitEvents(qctx, conn, unique, out)
+	li.fillFromBlockingLocks(qctx, unique, out)
+	li.fillFromWaitEvents(qctx, unique, out)
 	return out
 }
 
@@ -193,7 +187,13 @@ WHERE NOT blocked_locks.granted
 ORDER BY blocked_activity.application_name, blocking_locks.granted DESC
 `
 
-func (li *lockInspector) fillFromBlockingLocks(ctx context.Context, conn *pgx.Conn, appNames []string, out map[string]gui.LockStatus) {
+// fillFromBlockingLocks runs the blocking-locks catalog query. Caller must hold li.mu.
+func (li *lockInspector) fillFromBlockingLocks(ctx context.Context, appNames []string, out map[string]gui.LockStatus) {
+	conn, err := li.ensureConnLocked(ctx)
+	if err != nil {
+		li.unavailableUntil = time.Now().Add(15 * time.Second)
+		return
+	}
 	rows, err := conn.Query(ctx, blockingLocksSQL, appNames)
 	if err != nil {
 		li.invalidateConn()
@@ -233,7 +233,12 @@ WHERE datname = current_database()
   AND wait_event_type = 'Lock'
 `
 
-func (li *lockInspector) fillFromWaitEvents(ctx context.Context, conn *pgx.Conn, appNames []string, out map[string]gui.LockStatus) {
+func (li *lockInspector) fillFromWaitEvents(ctx context.Context, appNames []string, out map[string]gui.LockStatus) {
+	conn, err := li.ensureConnLocked(ctx)
+	if err != nil {
+		li.unavailableUntil = time.Now().Add(15 * time.Second)
+		return
+	}
 	rows, err := conn.Query(ctx, waitEventsSQL, appNames)
 	if err != nil {
 		li.invalidateConn()
